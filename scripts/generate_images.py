@@ -1,0 +1,1295 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import shutil
+import sys
+import time
+import traceback
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import gspread
+import pandas as pd
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+from google.oauth2.service_account import Credentials
+from PIL import Image
+
+# -----------------------------------------------------------------------------
+# Configuration / constants
+# -----------------------------------------------------------------------------
+
+SHEET_JOBS = "01_Jobs_Batches"
+SHEET_ITEMS = "02_Content_Items"
+SHEET_STYLES = "03_Style_Presets"
+SHEET_TEMPLATES = "04_Prompt_Templates"
+SHEET_QUEUE = "05_Generation_Queue"  # optional, script can create/use if present
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-image"  # Nano Banana 2
+DEFAULT_PLANNER_MODEL = "gemini-3.5-flash"
+DEFAULT_QC_MODEL = "gemini-3.5-flash"
+ALLOWED_JOB_STATUSES = {"todo", "redo"}
+SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+
+
+# -----------------------------------------------------------------------------
+# Data classes
+# -----------------------------------------------------------------------------
+
+@dataclass
+class AppConfig:
+    gemini_api_key: str
+    google_sheet_id: str
+    google_service_account_file: str
+    references_dir: Path
+    outputs_dir: Path
+    image_model: str = DEFAULT_IMAGE_MODEL
+    planner_model: str = DEFAULT_PLANNER_MODEL
+    qc_model: str = DEFAULT_QC_MODEL
+    sleep_between_generations_sec: float = 0.5
+    max_retries_per_variant: int = 1
+    image_aspect_ratio_default: str = "1:1"
+    image_size_default: str = "2K"
+    default_variants_per_item: int = 2
+    log_level: str = "INFO"
+    dry_run: bool = False
+
+
+@dataclass
+class StylePreset:
+    style_preset_id: str
+    style_name: str
+    style_description: str = ""
+    tone: str = ""
+    color_palette: str = ""
+    composition: str = ""
+    lighting: str = ""
+    do_include: str = ""
+    avoid: str = ""
+    ui_safe: str = ""
+    extra_notes: str = ""
+
+
+@dataclass
+class PromptTemplate:
+    prompt_template_id: str
+    template_name: str
+    template_body: str
+    extra_instructions: str = ""
+
+
+@dataclass
+class ContentItem:
+    item_id: str
+    job_id: str
+    content_type: str
+    title: str
+    source_text_or_topic: str
+    notes: str = ""
+    reference_files: List[str] = field(default_factory=list)
+    output_name_hint: str = ""
+
+
+@dataclass
+class Job:
+    job_id: str
+    status: str
+    job_type: str
+    job_name: str
+    asset_goal: str
+    output_folder: str
+    target_count: int
+    variants_per_item: int
+    aspect_ratio: str
+    style_preset_id: str
+    prompt_template_id: str
+    reference_files: List[str] = field(default_factory=list)
+    notes: str = ""
+    batch_seed_topics: str = ""
+
+
+@dataclass
+class CandidateResult:
+    item_id: str
+    variant_index: int
+    prompt: str
+    image_path: Path
+    qc_score: float
+    qc_decision: str
+    qc_reason: str
+    qc_details: Dict[str, Any]
+
+
+# -----------------------------------------------------------------------------
+# Utility helpers
+# -----------------------------------------------------------------------------
+
+
+def load_config() -> AppConfig:
+    load_dotenv()
+
+    gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    google_sheet_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
+    google_service_account_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
+
+    if not gemini_api_key:
+        raise ValueError("GEMINI_API_KEY fehlt in .env")
+    if not google_sheet_id:
+        raise ValueError("GOOGLE_SHEET_ID fehlt in .env")
+    if not google_service_account_file:
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_FILE fehlt in .env")
+
+    references_dir = Path(os.getenv("REFERENCE_DIR", "references")).expanduser().resolve()
+    outputs_dir = Path(os.getenv("OUTPUT_DIR", "outputs")).expanduser().resolve()
+
+    return AppConfig(
+        gemini_api_key=gemini_api_key,
+        google_sheet_id=google_sheet_id,
+        google_service_account_file=google_service_account_file,
+        references_dir=references_dir,
+        outputs_dir=outputs_dir,
+        image_model=os.getenv("IMAGE_MODEL", DEFAULT_IMAGE_MODEL),
+        planner_model=os.getenv("PLANNER_MODEL", DEFAULT_PLANNER_MODEL),
+        qc_model=os.getenv("QC_MODEL", DEFAULT_QC_MODEL),
+        sleep_between_generations_sec=float(os.getenv("SLEEP_BETWEEN_GENERATIONS_SEC", "0.5")),
+        max_retries_per_variant=int(os.getenv("MAX_RETRIES_PER_VARIANT", "1")),
+        image_aspect_ratio_default=os.getenv("DEFAULT_ASPECT_RATIO", "1:1"),
+        image_size_default=os.getenv("DEFAULT_IMAGE_SIZE", "2K"),
+        default_variants_per_item=int(os.getenv("DEFAULT_VARIANTS_PER_ITEM", "2")),
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
+        dry_run=os.getenv("DRY_RUN", "false").strip().lower() in {"1", "true", "yes"},
+    )
+
+
+
+def setup_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [normalize_key(col) for col in df.columns]
+    return df
+
+
+
+def normalize_key(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    return text.strip("_")
+
+
+
+def clean_string(value: Any) -> str:
+    if value is None:
+        return ""
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+
+def parse_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "" or pd.isna(value):
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+
+def parse_csv(value: Any) -> List[str]:
+    if value is None or value == "" or pd.isna(value):
+        return []
+    text = str(value)
+    parts = re.split(r"[,;\n]", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+
+def slugify(value: str, max_len: int = 60) -> str:
+    value = value.lower().strip()
+    value = re.sub(r"[^a-z0-9]+", "_", value)
+    value = value.strip("_")
+    return value[:max_len] or "item"
+
+
+
+def ensure_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+
+def _strip_code_fences(text: str) -> str:
+    """Entfernt ```json … ``` bzw. ``` … ``` um den eigentlichen Inhalt."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def _extract_json_span(text: str) -> Optional[str]:
+    """Liefert den Teilstring vom ersten '{' bis zur passenden '}'-Klammer.
+    Strings/Escapes werden mitgezählt, damit geschweifte Klammern innerhalb
+    von Strings nicht mitzählen. So wird führende/abschließende Prosa
+    (z. B. "Here is the JSON: …") entfernt."""
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return text[start:]  # unausgeglichen: Rest für einen Best-Effort-Versuch
+
+
+def safe_json_extract(text: str) -> Dict[str, Any]:
+    """Parst ein JSON-Objekt aus einer Modell-Antwort und toleriert die
+    üblichen LLM-Ausrutscher: Markdown-Codefences, Prosa vor/nach dem JSON
+    und abschließende Kommata. Wirft mit Kontext-Snippet, wenn nichts passt."""
+    if not text or not text.strip():
+        raise ValueError("Modell-Output war leer")
+
+    cleaned = _strip_code_fences(text)
+    candidates = [cleaned]
+    span = _extract_json_span(cleaned)
+    if span and span not in candidates:
+        candidates.append(span)
+    # zusätzlich jeweils ohne abschließende Kommata (", }" / ", ]")
+    candidates += [re.sub(r",(\s*[}\]])", r"\1", c) for c in list(candidates)]
+
+    for candidate in candidates:
+        try:
+            result = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(result, dict):
+            return result
+
+    snippet = cleaned[:400].replace("\n", " ")
+    raise ValueError(
+        f"Konnte kein gültiges JSON-Objekt im Modell-Output finden. "
+        f"Anfang der Antwort: {snippet!r}")
+
+
+
+def list_reference_images(reference_root: Path, requested_files: Iterable[str]) -> List[Path]:
+    paths: List[Path] = []
+    for file_name in requested_files:
+        candidate = (reference_root / file_name).resolve()
+        if candidate.exists() and candidate.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS:
+            paths.append(candidate)
+        else:
+            logging.warning("Referenzbild nicht gefunden oder kein unterstütztes Format: %s", file_name)
+    return paths
+
+
+
+def pil_image_to_bytes(image: Image.Image, fmt: str = "PNG") -> bytes:
+    from io import BytesIO
+
+    buffer = BytesIO()
+    image.save(buffer, format=fmt)
+    return buffer.getvalue()
+
+
+# -----------------------------------------------------------------------------
+# Google Sheets helpers
+# -----------------------------------------------------------------------------
+
+
+def create_sheet_client(config: AppConfig) -> gspread.Client:
+    creds = Credentials.from_service_account_file(config.google_service_account_file, scopes=SCOPES)
+    return gspread.authorize(creds)
+
+
+
+def detect_header_row(values: List[List[str]], sheet_name: str) -> int:
+    """
+    Detect the most likely header row within the first 10 rows.
+
+    This is useful because the imported XLSX may contain a title/instruction row
+    above the actual table headers.
+    """
+    expected_by_sheet = {
+        SHEET_JOBS: {"job_id", "status", "job_type"},
+        SHEET_ITEMS: {"item_id", "job_id", "content_type"},
+        SHEET_STYLES: {"style_preset_id"},
+        SHEET_TEMPLATES: {"prompt_template_id", "template_name"},
+        SHEET_QUEUE: {"job_id", "item_id"},
+    }
+    expected = expected_by_sheet.get(sheet_name, set())
+
+    best_idx = 0
+    best_score = -1
+
+    for idx, row in enumerate(values[:10]):
+        headers = {normalize_key(cell) for cell in row if normalize_key(cell)}
+        if not headers:
+            continue
+
+        score = len(headers)
+        if expected:
+            score += len(headers.intersection(expected)) * 100
+
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+
+        if expected and expected.issubset(headers):
+            return idx
+
+    logging.warning(
+        "Konnte Header-Zeile in Sheet '%s' nicht eindeutig erkennen. Verwende Zeile %s.",
+        sheet_name,
+        best_idx + 1,
+    )
+    return best_idx
+
+
+def read_sheet_df(workbook: gspread.Spreadsheet, sheet_name: str, required: bool = True) -> pd.DataFrame:
+    """
+    Robustly read a worksheet into a DataFrame.
+
+    - Finds the header row automatically, e.g. row 2 after an imported title row.
+    - Ignores empty header columns.
+    - Ignores duplicate non-empty headers after the first occurrence.
+    """
+    try:
+        worksheet = workbook.worksheet(sheet_name)
+    except gspread.WorksheetNotFound:
+        if required:
+            raise
+        return pd.DataFrame()
+
+    values = worksheet.get_all_values()
+    if not values:
+        return pd.DataFrame()
+
+    header_row_idx = detect_header_row(values, sheet_name)
+    raw_headers = values[header_row_idx]
+    normalized_headers = [normalize_key(h) for h in raw_headers]
+
+    logging.info("Sheet '%s': Header-Zeile erkannt als Zeile %s", sheet_name, header_row_idx + 1)
+
+    keep_indices: List[int] = []
+    seen: set[str] = set()
+    final_headers: List[str] = []
+
+    for idx, header in enumerate(normalized_headers):
+        if not header:
+            continue
+        if header in seen:
+            logging.warning(
+                "Doppelte Spalte '%s' in Sheet '%s' ignoriert. Bitte Header-Zeile prüfen.",
+                header,
+                sheet_name,
+            )
+            continue
+        seen.add(header)
+        keep_indices.append(idx)
+        final_headers.append(header)
+
+    if not final_headers:
+        return pd.DataFrame()
+
+    rows: List[Dict[str, Any]] = []
+    for raw_row in values[header_row_idx + 1:]:
+        row_dict: Dict[str, Any] = {}
+        row_has_value = False
+
+        for out_header, source_idx in zip(final_headers, keep_indices):
+            cell_value = raw_row[source_idx] if source_idx < len(raw_row) else ""
+            if str(cell_value).strip():
+                row_has_value = True
+            row_dict[out_header] = cell_value
+
+        if row_has_value:
+            rows.append(row_dict)
+
+    return pd.DataFrame(rows, columns=final_headers)
+
+
+
+def update_job_status(workbook: gspread.Spreadsheet, job_id: str, new_status: str) -> None:
+    worksheet = workbook.worksheet(SHEET_JOBS)
+    values = worksheet.get_all_values()
+    if not values:
+        logging.warning("Konnte Jobs-Sheet nicht für Statusupdate lesen")
+        return
+
+    header_row_idx = detect_header_row(values, SHEET_JOBS)
+    header = [normalize_key(h) for h in values[header_row_idx]]
+    try:
+        job_id_col = header.index("job_id") + 1
+        status_col = header.index("status") + 1
+    except ValueError:
+        logging.warning("job_id oder status Spalte im Jobs-Sheet nicht gefunden")
+        return
+
+    first_data_row_number = header_row_idx + 2
+    for row_idx, row in enumerate(values[header_row_idx + 1:], start=first_data_row_number):
+        if len(row) >= job_id_col and clean_string(row[job_id_col - 1]) == job_id:
+            worksheet.update_cell(row_idx, status_col, new_status)
+            logging.info("Job %s -> Status aktualisiert auf %s", job_id, new_status)
+            return
+
+    logging.warning("Job %s nicht im Sheet gefunden, Status nicht aktualisiert", job_id)
+
+
+
+def append_queue_rows(workbook: gspread.Spreadsheet, rows: List[List[Any]]) -> None:
+    if not rows:
+        return
+    try:
+        worksheet = workbook.worksheet(SHEET_QUEUE)
+    except gspread.WorksheetNotFound:
+        logging.info("Sheet %s nicht vorhanden, Queue-Logging wird übersprungen", SHEET_QUEUE)
+        return
+
+    worksheet.append_rows(rows, value_input_option="USER_ENTERED")
+
+
+# -----------------------------------------------------------------------------
+# Parsing sheet records into domain objects
+# -----------------------------------------------------------------------------
+
+
+def parse_jobs(df: pd.DataFrame, config: AppConfig) -> List[Job]:
+    if df.empty:
+        return []
+
+    required_cols = [
+        "job_id",
+        "status",
+        "job_type",
+        "job_name",
+        "asset_goal",
+        "output_folder",
+        "target_count",
+        "style_preset_id",
+        "prompt_template_id",
+    ]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Im Jobs-Sheet fehlen Spalten: {missing}")
+
+    jobs: List[Job] = []
+    for _, row in df.iterrows():
+        status = clean_string(row.get("status")).lower()
+        if status not in ALLOWED_JOB_STATUSES:
+            continue
+
+        job = Job(
+            job_id=clean_string(row.get("job_id")),
+            status=status,
+            job_type=clean_string(row.get("job_type")),
+            job_name=clean_string(row.get("job_name")),
+            asset_goal=clean_string(row.get("asset_goal")),
+            output_folder=clean_string(row.get("output_folder")),
+            target_count=parse_int(row.get("target_count"), 0),
+            variants_per_item=parse_int(row.get("variants_per_item"), config.default_variants_per_item),
+            aspect_ratio=clean_string(row.get("aspect_ratio")) or config.image_aspect_ratio_default,
+            style_preset_id=clean_string(row.get("style_preset_id")),
+            prompt_template_id=clean_string(row.get("prompt_template_id")),
+            reference_files=parse_csv(row.get("reference_files")),
+            notes=clean_string(row.get("notes")),
+            batch_seed_topics=clean_string(row.get("batch_seed_topics")),
+        )
+        jobs.append(job)
+    return jobs
+
+
+
+def parse_content_items(df: pd.DataFrame) -> List[ContentItem]:
+    if df.empty:
+        return []
+
+    required = ["item_id", "job_id", "content_type", "title", "source_text_or_topic"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Im Content-Items-Sheet fehlen Spalten: {missing}")
+
+    items: List[ContentItem] = []
+    for _, row in df.iterrows():
+        item = ContentItem(
+            item_id=clean_string(row.get("item_id")),
+            job_id=clean_string(row.get("job_id")),
+            content_type=clean_string(row.get("content_type")),
+            title=clean_string(row.get("title")),
+            source_text_or_topic=clean_string(row.get("source_text_or_topic")),
+            notes=clean_string(row.get("notes")),
+            reference_files=parse_csv(row.get("reference_files")),
+            output_name_hint=clean_string(row.get("output_name_hint")),
+        )
+        if item.item_id and item.job_id:
+            items.append(item)
+    return items
+
+
+
+def first_non_empty(row: pd.Series, *keys: str) -> str:
+    for key in keys:
+        value = clean_string(row.get(key))
+        if value:
+            return value
+    return ""
+
+
+def parse_styles(df: pd.DataFrame) -> Dict[str, StylePreset]:
+    """
+    Supports both older and newer style preset schemas.
+
+    New schema example:
+    style_preset_id, preset_name, use_case, maturity_level, visual_style,
+    color_palette, composition_rules, ui_safe_area, positive_style_prompt,
+    negative_style_prompt, reference_images, notes
+
+    Older schema example:
+    style_preset_id, style_name, style_description, tone, color_palette,
+    composition, lighting, do_include, avoid, ui_safe, extra_notes
+    """
+    if df.empty:
+        return {}
+    if "style_preset_id" not in df.columns:
+        raise ValueError("Im Style-Presets-Sheet fehlt die Spalte style_preset_id")
+
+    styles: Dict[str, StylePreset] = {}
+    for _, row in df.iterrows():
+        style_id = clean_string(row.get("style_preset_id"))
+        if not style_id:
+            continue
+
+        use_case = clean_string(row.get("use_case"))
+        maturity_level = clean_string(row.get("maturity_level"))
+        notes = first_non_empty(row, "extra_notes", "notes")
+
+        styles[style_id] = StylePreset(
+            style_preset_id=style_id,
+            style_name=first_non_empty(row, "style_name", "preset_name") or style_id,
+            style_description=first_non_empty(row, "style_description", "visual_style"),
+            tone=first_non_empty(row, "tone", "maturity_level", "use_case"),
+            color_palette=clean_string(row.get("color_palette")),
+            composition=first_non_empty(row, "composition", "composition_rules"),
+            lighting=clean_string(row.get("lighting")),
+            do_include=first_non_empty(row, "do_include", "positive_style_prompt"),
+            avoid=first_non_empty(row, "avoid", "negative_style_prompt"),
+            ui_safe=first_non_empty(row, "ui_safe", "ui_safe_area"),
+            extra_notes=" | ".join([part for part in [use_case, maturity_level, notes] if part]),
+        )
+    return styles
+
+
+def parse_templates(df: pd.DataFrame) -> Dict[str, PromptTemplate]:
+    """
+    Supports both older and newer prompt template schemas.
+
+    New schema example:
+    prompt_template_id, template_name, job_type, model, default_aspect_ratio,
+    default_image_size, template_purpose, prompt_template, negative_rules,
+    output_notes
+
+    Older schema example:
+    prompt_template_id, template_name, template_body, extra_instructions
+    """
+    if df.empty:
+        return {}
+
+    required = ["prompt_template_id", "template_name"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Im Prompt-Templates-Sheet fehlen Spalten: {missing}")
+
+    if "template_body" not in df.columns and "prompt_template" not in df.columns:
+        raise ValueError(
+            "Im Prompt-Templates-Sheet fehlt eine Prompt-Spalte. "
+            "Erwartet wird entweder 'template_body' oder 'prompt_template'."
+        )
+
+    templates: Dict[str, PromptTemplate] = {}
+    for _, row in df.iterrows():
+        template_id = clean_string(row.get("prompt_template_id"))
+        if not template_id:
+            continue
+
+        template_body = first_non_empty(row, "template_body", "prompt_template")
+        extra_parts = [
+            clean_string(row.get("extra_instructions")),
+            clean_string(row.get("negative_rules")),
+            clean_string(row.get("output_notes")),
+        ]
+        extra_instructions = "\n".join([part for part in extra_parts if part])
+
+        templates[template_id] = PromptTemplate(
+            prompt_template_id=template_id,
+            template_name=clean_string(row.get("template_name")) or template_id,
+            template_body=template_body,
+            extra_instructions=extra_instructions,
+        )
+    return templates
+
+
+# -----------------------------------------------------------------------------
+# Gemini client wrapper
+# -----------------------------------------------------------------------------
+
+
+# Antwort-Schemata für "structured output": Gemini dekodiert damit
+# eingeschränkt und liefert garantiert schema-konformes, gültiges JSON —
+# das verhindert die kaputten Planner/QC-Antworten, an denen json.loads sonst
+# scheitert ("Expecting ',' delimiter …").
+CONCEPTS_RESPONSE_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    required=["concepts"],
+    properties={
+        "concepts": types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(
+                type=types.Type.OBJECT,
+                required=["title", "brief"],
+                properties={
+                    "title": types.Schema(type=types.Type.STRING),
+                    "brief": types.Schema(type=types.Type.STRING),
+                    "must_show": types.Schema(
+                        type=types.Type.ARRAY,
+                        items=types.Schema(type=types.Type.STRING)),
+                    "must_avoid": types.Schema(
+                        type=types.Type.ARRAY,
+                        items=types.Schema(type=types.Type.STRING)),
+                },
+            ),
+        ),
+    },
+)
+
+QC_RESPONSE_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    required=["score", "decision", "reason"],
+    properties={
+        "score": types.Schema(type=types.Type.NUMBER),
+        "decision": types.Schema(type=types.Type.STRING,
+                                 enum=["accept", "retry", "reject"]),
+        "reason": types.Schema(type=types.Type.STRING),
+        "topic_match": types.Schema(type=types.Type.NUMBER),
+        "style_match": types.Schema(type=types.Type.NUMBER),
+        "visual_quality": types.Schema(type=types.Type.NUMBER),
+        "ui_suitability": types.Schema(type=types.Type.NUMBER),
+        "issues": types.Schema(type=types.Type.ARRAY,
+                               items=types.Schema(type=types.Type.STRING)),
+        "strengths": types.Schema(type=types.Type.ARRAY,
+                                  items=types.Schema(type=types.Type.STRING)),
+    },
+)
+
+
+class GeminiService:
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.client = genai.Client(api_key=config.gemini_api_key)
+
+    def plan_batch_concepts(self, job: Job, style: StylePreset, count: int) -> List[Dict[str, Any]]:
+        if count <= 0:
+            return []
+
+        seed_topics = job.batch_seed_topics or ""
+        planner_prompt = f"""
+You are planning image-generation concepts for a batch creative job.
+Return ONLY valid JSON.
+
+Task:
+Create {count} distinct visual concepts for one image-generation batch.
+Each concept should be useful as a single final image brief.
+
+Requirements:
+- Keep concepts clearly distinct from each other.
+- Match the batch goal.
+- Respect the target style.
+- Avoid duplicates and near-duplicates.
+- Keep each concept practical for image generation.
+- Do not include any markdown.
+
+Output schema:
+{{
+  "concepts": [
+    {{
+      "title": "short concept title",
+      "brief": "1-3 sentences describing the image concept",
+      "must_show": ["item1", "item2"],
+      "must_avoid": ["item1", "item2"]
+    }}
+  ]
+}}
+
+Batch context:
+job_name: {job.job_name}
+job_type: {job.job_type}
+asset_goal: {job.asset_goal}
+notes: {job.notes}
+seed_topics: {seed_topics}
+style_name: {style.style_name}
+style_description: {style.style_description}
+tone: {style.tone}
+color_palette: {style.color_palette}
+composition: {style.composition}
+lighting: {style.lighting}
+do_include: {style.do_include}
+avoid: {style.avoid}
+ui_safe: {style.ui_safe}
+extra_notes: {style.extra_notes}
+""".strip()
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, 3):   # ein Wiederholversuch bei kaputtem JSON
+            response = self.client.models.generate_content(
+                model=self.config.planner_model,
+                contents=planner_prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.6,
+                    response_mime_type="application/json",
+                    response_schema=CONCEPTS_RESPONSE_SCHEMA,
+                ),
+            )
+            raw_text = getattr(response, "text", "") or ""
+            try:
+                parsed = safe_json_extract(raw_text)
+            except Exception as e:
+                last_error = e
+                logging.warning(
+                    "Planner-Antwort nicht lesbar (Versuch %s/2): %s", attempt, e)
+                continue
+            concepts = parsed.get("concepts", [])
+            if not isinstance(concepts, list):
+                last_error = ValueError(
+                    "Planner-Modell hat kein gültiges concepts-Array geliefert")
+                logging.warning("%s (Versuch %s/2)", last_error, attempt)
+                continue
+            return concepts[:count]
+
+        raise ValueError(
+            f"Planner-Modell lieferte kein verwertbares JSON: {last_error}")
+
+    def generate_image(
+        self,
+        prompt: str,
+        aspect_ratio: str,
+        reference_images: Optional[List[Path]] = None,
+    ) -> Image.Image:
+        parts: List[Any] = [prompt]
+        for ref_path in reference_images or []:
+            parts.append(Image.open(ref_path))
+
+        response = self.client.models.generate_content(
+            model=self.config.image_model,
+            contents=parts,
+            config=types.GenerateContentConfig(
+                response_modalities=["IMAGE"],
+                image_config=types.ImageConfig(
+                    aspect_ratio=aspect_ratio,
+                    image_size=self.config.image_size_default,
+                ),
+            ),
+        )
+
+        for candidate in getattr(response, "candidates", []) or []:
+            content = getattr(candidate, "content", None)
+            if not content:
+                continue
+            for part in getattr(content, "parts", []) or []:
+                inline_data = getattr(part, "inline_data", None)
+                if not inline_data or not getattr(inline_data, "data", None):
+                    continue
+                from io import BytesIO
+                return Image.open(BytesIO(inline_data.data)).convert("RGB")
+
+        raise RuntimeError("Es wurde kein Bild im Gemini-Response gefunden")
+
+    def qc_image(
+        self,
+        image_path: Path,
+        prompt: str,
+        style: StylePreset,
+        item: ContentItem,
+        job: Job,
+    ) -> Dict[str, Any]:
+        qc_prompt = f"""
+You are reviewing one generated image candidate.
+Evaluate whether it fits the requested creative goal.
+Return ONLY valid JSON.
+
+Output schema:
+{{
+  "score": 0-100,
+  "decision": "accept" | "retry" | "reject",
+  "reason": "short explanation",
+  "topic_match": 0-100,
+  "style_match": 0-100,
+  "visual_quality": 0-100,
+  "ui_suitability": 0-100,
+  "issues": ["issue 1", "issue 2"],
+  "strengths": ["strength 1", "strength 2"]
+}}
+
+Job context:
+job_name: {job.job_name}
+job_type: {job.job_type}
+asset_goal: {job.asset_goal}
+notes: {job.notes}
+
+Item context:
+item_id: {item.item_id}
+title: {item.title}
+content_type: {item.content_type}
+source_text_or_topic: {item.source_text_or_topic}
+notes: {item.notes}
+
+Expected style:
+style_name: {style.style_name}
+style_description: {style.style_description}
+tone: {style.tone}
+color_palette: {style.color_palette}
+composition: {style.composition}
+lighting: {style.lighting}
+do_include: {style.do_include}
+avoid: {style.avoid}
+ui_safe: {style.ui_safe}
+extra_notes: {style.extra_notes}
+
+Original prompt used:
+{prompt}
+""".strip()
+
+        with Image.open(image_path) as img:
+            response = self.client.models.generate_content(
+                model=self.config.qc_model,
+                contents=[qc_prompt, img.copy()],
+                config=types.GenerateContentConfig(
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                    response_schema=QC_RESPONSE_SCHEMA,
+                ),
+            )
+
+        try:
+            return safe_json_extract(getattr(response, "text", "") or "")
+        except Exception as e:
+            # QC darf einen langen Batch nicht abbrechen: Bild behalten und
+            # zur manuellen Sichtung markieren, statt den Job zu killen.
+            logging.warning("QC-Antwort für %s nicht lesbar (%s) — Bild wird "
+                            "zur Sichtung übernommen.", image_path.name, e)
+            return {"score": 0, "decision": "accept",
+                    "reason": f"QC-Antwort nicht lesbar: {e}"}
+
+
+# -----------------------------------------------------------------------------
+# Prompt building / item preparation
+# -----------------------------------------------------------------------------
+
+
+def render_prompt(template: PromptTemplate, style: StylePreset, item: ContentItem, job: Job) -> str:
+    values = {
+        "job_id": job.job_id,
+        "job_name": job.job_name,
+        "job_type": job.job_type,
+        "asset_goal": job.asset_goal,
+        "job_notes": job.notes,
+        "item_id": item.item_id,
+        "content_type": item.content_type,
+        "title": item.title,
+        "source_text_or_topic": item.source_text_or_topic,
+        "item_notes": item.notes,
+        "aspect_ratio": job.aspect_ratio,
+
+        # Older style placeholders
+        "style_name": style.style_name,
+        "style_description": style.style_description,
+        "tone": style.tone,
+        "color_palette": style.color_palette,
+        "composition": style.composition,
+        "lighting": style.lighting,
+        "do_include": style.do_include,
+        "avoid": style.avoid,
+        "ui_safe": style.ui_safe,
+        "extra_notes": style.extra_notes,
+
+        # Newer style placeholders from your current Sheet
+        "preset_name": style.style_name,
+        "visual_style": style.style_description,
+        "maturity_level": style.tone,
+        "composition_rules": style.composition,
+        "ui_safe_area": style.ui_safe,
+        "positive_style_prompt": style.do_include,
+        "negative_style_prompt": style.avoid,
+        "notes": style.extra_notes,
+    }
+
+    prompt = template.template_body
+    for key, value in values.items():
+        prompt = prompt.replace("{" + key + "}", value or "")
+
+    unresolved = sorted(set(re.findall(r"\{[a-zA-Z0-9_]+\}", prompt)))
+    if unresolved:
+        logging.warning(
+            "Prompt enthält nicht ersetzte Platzhalter: %s. Prüfe Template-Spalten/Platzhalter.",
+            ", ".join(unresolved),
+        )
+
+    extra = clean_string(template.extra_instructions)
+    if extra:
+        prompt = f"{prompt}\n\nAdditional instructions:\n{extra}".strip()
+
+    return prompt.strip()
+
+
+
+def prepare_items_for_job(
+    job: Job,
+    content_items: List[ContentItem],
+    gemini: GeminiService,
+    style: StylePreset,
+) -> List[ContentItem]:
+    if job.job_type == "content_linked":
+        items = [item for item in content_items if item.job_id == job.job_id]
+        if not items:
+            raise ValueError(f"Job {job.job_id} ist content_linked, aber es wurden keine Content Items gefunden")
+        return items
+
+    if job.job_type == "batch_theme":
+        count = job.target_count
+        if count <= 0:
+            raise ValueError(f"Job {job.job_id} hat target_count <= 0")
+        concepts = gemini.plan_batch_concepts(job=job, style=style, count=count)
+        items: List[ContentItem] = []
+        for idx, concept in enumerate(concepts, start=1):
+            title = clean_string(concept.get("title")) or f"concept_{idx:03d}"
+            brief = clean_string(concept.get("brief"))
+            must_show = concept.get("must_show", []) or []
+            must_avoid = concept.get("must_avoid", []) or []
+            notes = ""
+            if must_show:
+                notes += f"Must show: {', '.join(map(str, must_show))}. "
+            if must_avoid:
+                notes += f"Must avoid: {', '.join(map(str, must_avoid))}."
+            items.append(
+                ContentItem(
+                    item_id=f"{job.job_id}_ITEM_{idx:03d}",
+                    job_id=job.job_id,
+                    content_type="planned_batch_item",
+                    title=title,
+                    source_text_or_topic=brief,
+                    notes=notes.strip(),
+                    output_name_hint=slugify(title),
+                )
+            )
+        return items
+
+    raise ValueError(f"Unbekannter job_type für Job {job.job_id}: {job.job_type}")
+
+
+# -----------------------------------------------------------------------------
+# Generation / selection workflow
+# -----------------------------------------------------------------------------
+
+
+def save_image(image: Image.Image, path: Path) -> None:
+    ensure_dir(path.parent)
+    image.save(path, format="PNG")
+
+
+
+def run_job(
+    workbook: gspread.Spreadsheet,
+    config: AppConfig,
+    gemini: GeminiService,
+    job: Job,
+    styles: Dict[str, StylePreset],
+    templates: Dict[str, PromptTemplate],
+    content_items: List[ContentItem],
+) -> Dict[str, Any]:
+    logging.info("=" * 80)
+    logging.info("Starte Job %s | %s", job.job_id, job.job_name)
+
+    if job.style_preset_id not in styles:
+        raise ValueError(f"Style Preset {job.style_preset_id} für Job {job.job_id} nicht gefunden")
+    if job.prompt_template_id not in templates:
+        raise ValueError(f"Prompt Template {job.prompt_template_id} für Job {job.job_id} nicht gefunden")
+
+    style = styles[job.style_preset_id]
+    template = templates[job.prompt_template_id]
+
+    base_output_dir = Path(job.output_folder)
+    if not base_output_dir.is_absolute():
+        base_output_dir = (Path.cwd() / base_output_dir).resolve()
+    if not base_output_dir.exists():
+        raise FileNotFoundError(f"Output-Ordner für Job {job.job_id} existiert nicht: {base_output_dir}")
+
+    candidates_dir = ensure_dir(base_output_dir / "candidates")
+    selected_dir = ensure_dir(base_output_dir / "selected")
+    metadata_dir = ensure_dir(base_output_dir / "metadata")
+
+    job_items = prepare_items_for_job(job, content_items, gemini, style)
+
+    job_reference_paths = list_reference_images(config.references_dir, job.reference_files)
+    queue_rows: List[List[Any]] = []
+    results_summary: List[Dict[str, Any]] = []
+
+    for item_index, item in enumerate(job_items, start=1):
+        logging.info("[%s] Bearbeite Item %s/%s: %s", job.job_id, item_index, len(job_items), item.title)
+
+        item_prompt = render_prompt(template=template, style=style, item=item, job=job)
+        item_reference_paths = job_reference_paths + list_reference_images(config.references_dir, item.reference_files)
+
+        candidate_results: List[CandidateResult] = []
+        variant_count = max(1, job.variants_per_item or config.default_variants_per_item)
+
+        for variant_idx in range(1, variant_count + 1):
+            attempt = 0
+            final_image_path: Optional[Path] = None
+            qc_payload: Dict[str, Any] = {}
+            qc_score = -1.0
+            qc_decision = "reject"
+            qc_reason = ""
+
+            while attempt <= config.max_retries_per_variant:
+                attempt += 1
+                logging.info(
+                    "[%s | %s] Generiere Variante %s (Versuch %s)",
+                    job.job_id,
+                    item.item_id,
+                    variant_idx,
+                    attempt,
+                )
+
+                if config.dry_run:
+                    logging.info("DRY_RUN aktiv: Generierung wird übersprungen")
+                    break
+
+                image = gemini.generate_image(
+                    prompt=item_prompt,
+                    aspect_ratio=job.aspect_ratio,
+                    reference_images=item_reference_paths,
+                )
+
+                file_stem = item.output_name_hint or slugify(item.title or item.item_id)
+                final_image_path = candidates_dir / f"{item.item_id}_{file_stem}_v{variant_idx:02d}_try{attempt:02d}.png"
+                save_image(image, final_image_path)
+
+                qc_payload = gemini.qc_image(
+                    image_path=final_image_path,
+                    prompt=item_prompt,
+                    style=style,
+                    item=item,
+                    job=job,
+                )
+                qc_score = float(qc_payload.get("score", 0) or 0)
+                qc_decision = clean_string(qc_payload.get("decision")).lower() or "reject"
+                qc_reason = clean_string(qc_payload.get("reason"))
+
+                logging.info(
+                    "[%s | %s] QC für Variante %s: score=%s decision=%s",
+                    job.job_id,
+                    item.item_id,
+                    variant_idx,
+                    qc_score,
+                    qc_decision,
+                )
+
+                if qc_decision != "retry":
+                    break
+
+                time.sleep(config.sleep_between_generations_sec)
+
+            if final_image_path is None:
+                continue
+
+            candidate_results.append(
+                CandidateResult(
+                    item_id=item.item_id,
+                    variant_index=variant_idx,
+                    prompt=item_prompt,
+                    image_path=final_image_path,
+                    qc_score=qc_score,
+                    qc_decision=qc_decision,
+                    qc_reason=qc_reason,
+                    qc_details=qc_payload,
+                )
+            )
+
+            queue_rows.append(
+                [
+                    datetime.now().isoformat(timespec="seconds"),
+                    job.job_id,
+                    item.item_id,
+                    item.title,
+                    variant_idx,
+                    str(final_image_path),
+                    qc_score,
+                    qc_decision,
+                    qc_reason,
+                ]
+            )
+
+            time.sleep(config.sleep_between_generations_sec)
+
+        if not candidate_results:
+            logging.warning("[%s | %s] Keine Kandidaten erzeugt", job.job_id, item.item_id)
+            continue
+
+        best = sorted(
+            candidate_results,
+            key=lambda r: (
+                1 if r.qc_decision == "accept" else 0,
+                r.qc_score,
+            ),
+            reverse=True,
+        )[0]
+
+        selected_name = f"{item.item_id}_{slugify(item.title or item.item_id)}_BEST.png"
+        selected_path = selected_dir / selected_name
+        shutil.copy2(best.image_path, selected_path)
+
+        item_meta = {
+            "job_id": job.job_id,
+            "job_name": job.job_name,
+            "item_id": item.item_id,
+            "item_title": item.title,
+            "source_text_or_topic": item.source_text_or_topic,
+            "selected_image": str(selected_path),
+            "selected_from_candidate": str(best.image_path),
+            "selected_score": best.qc_score,
+            "selected_decision": best.qc_decision,
+            "selected_reason": best.qc_reason,
+            "prompt": best.prompt,
+            "all_candidates": [
+                {
+                    "variant_index": c.variant_index,
+                    "image_path": str(c.image_path),
+                    "qc_score": c.qc_score,
+                    "qc_decision": c.qc_decision,
+                    "qc_reason": c.qc_reason,
+                    "qc_details": c.qc_details,
+                }
+                for c in candidate_results
+            ],
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        meta_path = metadata_dir / f"{item.item_id}.json"
+        meta_path.write_text(json.dumps(item_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        results_summary.append(item_meta)
+
+    append_queue_rows(workbook, queue_rows)
+
+    summary_path = metadata_dir / f"{job.job_id}_summary.json"
+    summary_path.write_text(json.dumps(results_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # mark done only if we got at least one result
+    if results_summary:
+        update_job_status(workbook, job.job_id, "done")
+    else:
+        logging.warning("Job %s hat keine Ergebnisse erzeugt. Status bleibt unverändert.", job.job_id)
+
+    logging.info("Job %s abgeschlossen. %s Items verarbeitet.", job.job_id, len(results_summary))
+    return {
+        "job_id": job.job_id,
+        "items_processed": len(results_summary),
+        "output_dir": str(base_output_dir),
+    }
+
+
+# -----------------------------------------------------------------------------
+# Main entry point
+# -----------------------------------------------------------------------------
+
+
+def main() -> int:
+    try:
+        config = load_config()
+        setup_logging(config.log_level)
+
+        logging.info("Lade Google Sheet und Konfiguration …")
+        sheet_client = create_sheet_client(config)
+        workbook = sheet_client.open_by_key(config.google_sheet_id)
+
+        jobs_df = read_sheet_df(workbook, SHEET_JOBS, required=True)
+        items_df = read_sheet_df(workbook, SHEET_ITEMS, required=False)
+        styles_df = read_sheet_df(workbook, SHEET_STYLES, required=True)
+        templates_df = read_sheet_df(workbook, SHEET_TEMPLATES, required=True)
+
+        jobs = parse_jobs(jobs_df, config=config)
+        items = parse_content_items(items_df)
+        styles = parse_styles(styles_df)
+        templates = parse_templates(templates_df)
+
+        if not jobs:
+            logging.info("Keine Jobs mit Status todo oder redo gefunden.")
+            return 0
+
+        logging.info("Gefundene Jobs: %s", len(jobs))
+        gemini = GeminiService(config)
+
+        overall_summary = []
+        for job in jobs:
+            try:
+                summary = run_job(
+                    workbook=workbook,
+                    config=config,
+                    gemini=gemini,
+                    job=job,
+                    styles=styles,
+                    templates=templates,
+                    content_items=items,
+                )
+                overall_summary.append(summary)
+            except Exception as job_error:
+                logging.exception("Fehler bei Job %s: %s", job.job_id, job_error)
+                # leave status as todo/redo to allow re-run later
+                continue
+
+        logging.info("Alle verarbeiteten Jobs: %s", len(overall_summary))
+        for summary in overall_summary:
+            logging.info(" - %s | %s Items | %s", summary["job_id"], summary["items_processed"], summary["output_dir"])
+        return 0
+
+    except Exception as exc:
+        logging.error("Fataler Fehler: %s", exc)
+        traceback.print_exc()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

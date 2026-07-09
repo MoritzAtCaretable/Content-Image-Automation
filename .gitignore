@@ -1,0 +1,31 @@
+# ── Geheimnisse / lokale Konfiguration — NIEMALS committen! ──
+.env
+secrets/
+service_account*.json
+*.json.key
+# Sicherheitsnetz: keine JSON-Dateien versehentlich hochladen (Keys etc.).
+# Falls du doch mal eine JSON committen willst:  git add -f <datei>
+*.json
+
+# ── Virtuelle Umgebung ──
+.venv/
+venv/
+
+# ── Generierte Bilder & Metadaten ──
+outputs/
+
+# ── macOS App-Bundle (wird lokal vom Installer gebaut) ──
+Content Image Automation.app/
+
+# ── Python-Cache ──
+__pycache__/
+*.py[cod]
+
+# ── Editoren / Werkzeuge ──
+.vscode/
+.idea/
+.claude/
+
+# ── Betriebssystem ──
+.DS_Store
+Thumbs.db

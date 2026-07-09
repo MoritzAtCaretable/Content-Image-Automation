@@ -1,0 +1,8 @@
+google-genai
+gspread
+google-auth
+python-dotenv
+pandas
+pillow
+requests
+customtkinter
