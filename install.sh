@@ -17,6 +17,21 @@ echo "════════════════════════�
 echo "  Content Image Automation — Einrichtung (macOS)"
 echo "════════════════════════════════════════"
 
+# macOS schützt Schreibtisch/Dokumente/Downloads/iCloud (TCC). Eine per Finder
+# gestartete, unsignierte App darf dort NICHT auf ihre eigenen Dateien zugreifen
+# und schließt sich beim Doppelklick sofort. Wir merken uns das und warnen am Ende.
+PROTECTED_LOCATION=""
+case "$PWD/" in
+  "$HOME/Desktop/"*|"$HOME/Documents/"*|"$HOME/Downloads/"*|"$HOME/Library/Mobile Documents/"*)
+    PROTECTED_LOCATION="$PWD"
+    echo ""
+    echo "⚠️  ACHTUNG: Dieser Ordner liegt in einem von macOS geschützten Bereich"
+    echo "   (Schreibtisch/Dokumente/Downloads/iCloud). Die App startet dann per"
+    echo "   Doppelklick evtl. nicht. Empfehlung: Ordner nach ~/Applications oder"
+    echo "   in den Benutzerordner (~/) verschieben. Details am Ende dieser Ausgabe."
+    echo "";;
+esac
+
 # ─────────────────────────────────────────────
 # HIER ANPASSEN, falls dein Repo anders heißt:
 # ─────────────────────────────────────────────
@@ -89,3 +104,24 @@ echo "  2. service_account.json in den Ordner 'secrets/' legen"
 echo "  3. Google Sheet mit der Service-Account-E-Mail als Bearbeiter teilen"
 echo "  4. 'Content Image Automation.app' per Doppelklick starten"
 echo "════════════════════════════════════════"
+
+if [ -n "$PROTECTED_LOCATION" ]; then
+    echo ""
+    echo "⚠️  WICHTIG — geschützter Ort erkannt:"
+    echo "   $PROTECTED_LOCATION"
+    echo ""
+    echo "   macOS lässt die App hier per Doppelklick evtl. NICHT auf ihre Dateien"
+    echo "   zugreifen (sie öffnet und schließt sich sofort). Zwei Lösungen:"
+    echo ""
+    echo "   A) EMPFOHLEN — Ordner verschieben (danach funktioniert alles ohne"
+    echo "      Extra-Rechte). Im Terminal z. B.:"
+    echo "         mkdir -p ~/Applications"
+    echo "         mv \"$PROTECTED_LOCATION\" ~/Applications/"
+    echo "         cd ~/Applications/$(basename "$PROTECTED_LOCATION")"
+    echo "         ./install.sh"
+    echo ""
+    echo "   B) ODER der App Zugriff geben: Systemeinstellungen → Datenschutz &"
+    echo "      Sicherheit → Festplattenvollzugriff → '+' → diese App auswählen"
+    echo "      und aktivieren. Nach jedem Neu-Bauen ggf. erneut nötig."
+    echo "════════════════════════════════════════"
+fi

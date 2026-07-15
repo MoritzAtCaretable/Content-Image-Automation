@@ -48,23 +48,47 @@ PLIST
 
 cat > "$MACOS_DIR/run" <<'RUNNER'
 #!/bin/bash
-set -e
+# Launcher für "Content Image Automation.app".
+# Startet die GUI mit der venv-Python (absoluter Pfad). Fehler landen in einem
+# Log AUSSERHALB des Projektordners (der kann z. B. im Schreibtisch durch macOS
+# gesperrt sein) und werden als Dialog gezeigt — die App schließt sich also nie
+# mehr stumm.
 
 APP_MACOS_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$APP_MACOS_DIR/../../.." && pwd)"
 
-cd "$PROJECT_ROOT"
+LOGDIR="$HOME/Library/Logs"
+mkdir -p "$LOGDIR" 2>/dev/null || LOGDIR="/tmp"
+LOGFILE="$LOGDIR/ContentImageAutomation.log"
 
-if [ -x ".venv/bin/python" ]; then
-  PYTHON=".venv/bin/python"
-else
-  PYTHON="$(command -v python3)"
+PYTHON="$PROJECT_ROOT/.venv/bin/python"
+[ -x "$PYTHON" ] || PYTHON="$(command -v python3 || echo /usr/bin/python3)"
+
+cd "$PROJECT_ROOT" 2>/dev/null
+
+if "$PYTHON" "$PROJECT_ROOT/scripts/image_generator_ui.py" 2>"$LOGFILE"; then
+  exit 0
 fi
 
-exec "$PYTHON" "scripts/image_generator_ui.py"
+# Fehlstart: Ursache aus dem Log lesen und passend melden. Dialogtexte bewusst
+# in reinem ASCII — beim Finder-Start ist das Locale evtl. nicht UTF-8, dann
+# wuerden Umlaute/Sonderzeichen den AppleScript-Parser sprengen.
+ERR="$(tail -c 1400 "$LOGFILE" 2>/dev/null)"
+if printf '%s' "$ERR" | grep -qiE "not permitted|PermissionError"; then
+  osascript -e 'display dialog "Zugriff verweigert: Content Image Automation darf nicht auf seinen Projektordner zugreifen. macOS blockiert Apps aus geschuetzten Ordnern (Schreibtisch, Dokumente, Downloads, iCloud). Loesung A (empfohlen): Projektordner an einen ungeschuetzten Ort verschieben (z.B. ~/Applications) und die App dort per install.sh neu bauen. Loesung B: Systemeinstellungen - Datenschutz und Sicherheit - Festplattenvollzugriff - diese App hinzufuegen und aktivieren, dann neu starten." buttons {"OK"} default button "OK" with icon caution with title "Content Image Automation - Zugriff verweigert"'
+else
+  osascript -e "display dialog \"Content Image Automation konnte nicht starten. Details im Log: $LOGFILE\" buttons {\"OK\"} default button \"OK\" with icon stop with title \"Content Image Automation\""
+fi
+exit 1
 RUNNER
 
 chmod +x "$MACOS_DIR/run"
+
+# Quarantäne-Flag entfernen und bei LaunchServices neu registrieren (hilft nach
+# einem Rebuild, dass Finder das aktuelle Bundle nimmt).
+xattr -cr "$APP_DIR" 2>/dev/null || true
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+[ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$APP_DIR" >/dev/null 2>&1 || true
 
 # Touch app bundle so Finder refreshes icon metadata.
 touch "$APP_DIR"

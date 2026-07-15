@@ -137,7 +137,8 @@ ausführen (`./install.sh` bzw. `install.bat`).
 | Symptom | Lösung |
 |---|---|
 | `install.sh` startet nicht per Doppelklick | Im Terminal: `chmod +x install.sh && ./install.sh` |
-| App startet nicht (Mac) | `bash scripts/create_macos_app_with_icon.sh` erneut ausführen; ggf. `killall Dock` |
+| **App öffnet & schließt sich sofort (Mac)** | macOS-Datenschutz (TCC): Liegt der Ordner in **Schreibtisch/Dokumente/Downloads/iCloud**, darf die per Doppelklick gestartete App nicht auf ihre Dateien zugreifen. **Lösung A (empfohlen):** Ordner nach `~/Applications` oder `~/` verschieben und dort einmal `./install.sh` ausführen. **Lösung B:** Systemeinstellungen → Datenschutz & Sicherheit → **Festplattenvollzugriff** → App hinzufügen & aktivieren. Der Fehler steht im Log `~/Library/Logs/ContentImageAutomation.log`. |
+| App startet nicht (Mac), andere Ursache | Log prüfen: `~/Library/Logs/ContentImageAutomation.log`; App neu bauen: `bash scripts/create_macos_app_with_icon.sh` |
 | Gemini „API key not valid" | Key prüfen; „Generative Language API" im Google-Cloud-Projekt aktivieren |
 | `.env` wird nicht gefunden | Muss exakt `.env` heißen und im Projektordner liegen |
 | Zugriff aufs Sheet scheitert | Sheet mit der Service-Account-E-Mail als **Bearbeiter** teilen |
