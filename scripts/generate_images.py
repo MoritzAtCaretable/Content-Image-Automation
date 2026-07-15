@@ -17,6 +17,7 @@ import gspread
 import pandas as pd
 from dotenv import load_dotenv
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 from google.oauth2.service_account import Credentials
 from PIL import Image
@@ -38,7 +39,7 @@ SCOPES = [
 
 DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-image"  # Nano Banana 2
 DEFAULT_PLANNER_MODEL = "gemini-3.5-flash"
-DEFAULT_QC_MODEL = "gemini-3.5-flash"
+DEFAULT_QC_MODEL = "gemini-3.1-flash-lite"
 ALLOWED_JOB_STATUSES = {"todo", "redo"}
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 
@@ -717,10 +718,34 @@ QC_RESPONSE_SCHEMA = types.Schema(
 )
 
 
+# HTTP-Status, bei denen sich Warten + erneut versuchen lohnt (Überlastung /
+# transiente Serverfehler / Rate-Limit). Alles andere ist ein echter Fehler.
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+# Wartezeiten zwischen den Versuchen (Sekunden) — insgesamt 5 Versuche.
+RETRY_DELAYS_SEC = [10, 30, 60, 120]
+
+
 class GeminiService:
     def __init__(self, config: AppConfig):
         self.config = config
         self.client = genai.Client(api_key=config.gemini_api_key)
+
+    def _generate_with_retry(self, purpose: str, **kwargs) -> Any:
+        """generate_content mit Backoff-Retry bei Überlastung (z. B. 503
+        'high demand'). Das SDK selbst gibt nach wenigen Sekunden auf — hier
+        warten wir deutlich länger, damit ein Batch-Lauf Lastspitzen übersteht."""
+        for attempt, delay in enumerate(RETRY_DELAYS_SEC + [None], start=1):
+            try:
+                return self.client.models.generate_content(**kwargs)
+            except genai_errors.APIError as e:
+                code = getattr(e, "code", None) or getattr(e, "status_code", None)
+                if code not in RETRYABLE_STATUS_CODES or delay is None:
+                    raise
+                logging.warning(
+                    "%s: Modell antwortet mit %s (überlastet) — warte %ss und "
+                    "versuche erneut (%s/%s) …",
+                    purpose, code, delay, attempt, len(RETRY_DELAYS_SEC) + 1)
+                time.sleep(delay)
 
     def plan_batch_concepts(self, job: Job, style: StylePreset, count: int) -> List[Dict[str, Any]]:
         if count <= 0:
@@ -775,7 +800,8 @@ extra_notes: {style.extra_notes}
 
         last_error: Optional[Exception] = None
         for attempt in range(1, 3):   # ein Wiederholversuch bei kaputtem JSON
-            response = self.client.models.generate_content(
+            response = self._generate_with_retry(
+                "Motiv-Planung",
                 model=self.config.planner_model,
                 contents=planner_prompt,
                 config=types.GenerateContentConfig(
@@ -813,7 +839,8 @@ extra_notes: {style.extra_notes}
         for ref_path in reference_images or []:
             parts.append(Image.open(ref_path))
 
-        response = self.client.models.generate_content(
+        response = self._generate_with_retry(
+            "Bildgenerierung",
             model=self.config.image_model,
             contents=parts,
             config=types.GenerateContentConfig(
@@ -893,26 +920,27 @@ Original prompt used:
 {prompt}
 """.strip()
 
-        with Image.open(image_path) as img:
-            response = self.client.models.generate_content(
-                model=self.config.qc_model,
-                contents=[qc_prompt, img.copy()],
-                config=types.GenerateContentConfig(
-                    temperature=0.2,
-                    response_mime_type="application/json",
-                    response_schema=QC_RESPONSE_SCHEMA,
-                ),
-            )
-
+        # QC darf einen langen Batch NIE abbrechen: schlägt der API-Aufruf trotz
+        # Retries fehl oder ist die Antwort unlesbar, wird das Bild behalten und
+        # zur manuellen Sichtung markiert, statt den Job zu killen.
         try:
+            with Image.open(image_path) as img:
+                response = self._generate_with_retry(
+                    f"QC {image_path.name}",
+                    model=self.config.qc_model,
+                    contents=[qc_prompt, img.copy()],
+                    config=types.GenerateContentConfig(
+                        temperature=0.2,
+                        response_mime_type="application/json",
+                        response_schema=QC_RESPONSE_SCHEMA,
+                    ),
+                )
             return safe_json_extract(getattr(response, "text", "") or "")
         except Exception as e:
-            # QC darf einen langen Batch nicht abbrechen: Bild behalten und
-            # zur manuellen Sichtung markieren, statt den Job zu killen.
-            logging.warning("QC-Antwort für %s nicht lesbar (%s) — Bild wird "
+            logging.warning("QC für %s fehlgeschlagen (%s) — Bild wird "
                             "zur Sichtung übernommen.", image_path.name, e)
             return {"score": 0, "decision": "accept",
-                    "reason": f"QC-Antwort nicht lesbar: {e}"}
+                    "reason": f"QC fehlgeschlagen: {e}"}
 
 
 # -----------------------------------------------------------------------------
@@ -1066,6 +1094,11 @@ def run_job(
     job_reference_paths = list_reference_images(config.references_dir, job.reference_files)
     queue_rows: List[List[Any]] = []
     results_summary: List[Dict[str, Any]] = []
+    # Schutzschalter: einzelne fehlgeschlagene Varianten werden übersprungen,
+    # aber ab dieser Zahl Fehlschläge IN FOLGE ist die API offenbar down —
+    # dann sauber abbrechen statt stundenlang gegen die Wand zu laufen.
+    consecutive_failures = 0
+    MAX_CONSECUTIVE_FAILURES = 3
 
     for item_index, item in enumerate(job_items, start=1):
         logging.info("[%s] Bearbeite Item %s/%s: %s", job.job_id, item_index, len(job_items), item.title)
@@ -1098,11 +1131,27 @@ def run_job(
                     logging.info("DRY_RUN aktiv: Generierung wird übersprungen")
                     break
 
-                image = gemini.generate_image(
-                    prompt=item_prompt,
-                    aspect_ratio=job.aspect_ratio,
-                    reference_images=item_reference_paths,
-                )
+                try:
+                    image = gemini.generate_image(
+                        prompt=item_prompt,
+                        aspect_ratio=job.aspect_ratio,
+                        reference_images=item_reference_paths,
+                    )
+                except Exception as e:
+                    consecutive_failures += 1
+                    logging.error(
+                        "[%s | %s] Variante %s endgültig fehlgeschlagen (%s) — "
+                        "wird übersprungen (%s/%s Fehlschläge in Folge).",
+                        job.job_id, item.item_id, variant_idx, e,
+                        consecutive_failures, MAX_CONSECUTIVE_FAILURES)
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                        raise RuntimeError(
+                            f"{MAX_CONSECUTIVE_FAILURES} Varianten in Folge "
+                            "fehlgeschlagen — API scheint nicht erreichbar. "
+                            "Job abgebrochen; Status bleibt auf todo/redo, "
+                            "einfach später erneut starten.") from e
+                    break  # nächste Variante / nächstes Item
+                consecutive_failures = 0
 
                 file_stem = item.output_name_hint or slugify(item.title or item.item_id)
                 final_image_path = candidates_dir / f"{item.item_id}_{file_stem}_v{variant_idx:02d}_try{attempt:02d}.png"
