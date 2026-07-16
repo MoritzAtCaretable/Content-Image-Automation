@@ -37,7 +37,12 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-image"  # Nano Banana 2
+# Standard ist das schnelle/günstige Lite-Bildmodell — es kann aber NUR 1K.
+# Verlangt ein Job 2K/4K, wechselt generate_image automatisch auf das große
+# Modell (FULL_IMAGE_MODEL), siehe _resolve_image_model.
+DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-lite-image"
+FULL_IMAGE_MODEL = "gemini-3.1-flash-image"     # Nano Banana 2
+LITE_ONLY_IMAGE_SIZE = "1K"
 DEFAULT_PLANNER_MODEL = "gemini-3.5-flash"
 DEFAULT_QC_MODEL = "gemini-3.1-flash-lite"
 ALLOWED_JOB_STATUSES = {"todo", "redo"}
@@ -61,7 +66,7 @@ class AppConfig:
     sleep_between_generations_sec: float = 0.5
     max_retries_per_variant: int = 1
     image_aspect_ratio_default: str = "1:1"
-    image_size_default: str = "2K"
+    image_size_default: str = "1K"
     default_variants_per_item: int = 2
     log_level: str = "INFO"
     dry_run: bool = False
@@ -118,6 +123,8 @@ class Job:
     reference_files: List[str] = field(default_factory=list)
     notes: str = ""
     batch_seed_topics: str = ""
+    image_size: str = ""          # leer = DEFAULT_IMAGE_SIZE aus der .env
+    qc_enabled: bool = True       # Sheet-Spalte qc_enabled (ja/nein); leer = ja
 
 
 @dataclass
@@ -166,7 +173,7 @@ def load_config() -> AppConfig:
         sleep_between_generations_sec=float(os.getenv("SLEEP_BETWEEN_GENERATIONS_SEC", "0.5")),
         max_retries_per_variant=int(os.getenv("MAX_RETRIES_PER_VARIANT", "1")),
         image_aspect_ratio_default=os.getenv("DEFAULT_ASPECT_RATIO", "1:1"),
-        image_size_default=os.getenv("DEFAULT_IMAGE_SIZE", "2K"),
+        image_size_default=os.getenv("DEFAULT_IMAGE_SIZE", "1K"),
         default_variants_per_item=int(os.getenv("DEFAULT_VARIANTS_PER_ITEM", "2")),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         dry_run=os.getenv("DRY_RUN", "false").strip().lower() in {"1", "true", "yes"},
@@ -222,6 +229,17 @@ def parse_csv(value: Any) -> List[str]:
     text = str(value)
     parts = re.split(r"[,;\n]", text)
     return [p.strip() for p in parts if p.strip()]
+
+
+
+def parse_bool(value: Any, default: bool = True) -> bool:
+    """ja/nein-Zellen aus dem Sheet (auch yes/true/1 bzw. no/false/0)."""
+    text = clean_string(value).lower()
+    if text in {"ja", "yes", "true", "1", "an", "on", "x"}:
+        return True
+    if text in {"nein", "no", "false", "0", "aus", "off"}:
+        return False
+    return default
 
 
 
@@ -531,6 +549,9 @@ def parse_jobs(df: pd.DataFrame, config: AppConfig) -> List[Job]:
             reference_files=parse_csv(row.get("reference_files")),
             notes=clean_string(row.get("notes")),
             batch_seed_topics=clean_string(row.get("batch_seed_topics")),
+            image_size=clean_string(row.get("image_size")).upper()
+                       or config.image_size_default,
+            qc_enabled=parse_bool(row.get("qc_enabled"), default=True),
         )
         jobs.append(job)
     return jobs
@@ -829,25 +850,39 @@ extra_notes: {style.extra_notes}
         raise ValueError(
             f"Planner-Modell lieferte kein verwertbares JSON: {last_error}")
 
+    def _resolve_image_model(self, image_size: str) -> str:
+        """Das Lite-Bildmodell beherrscht nur 1K. Verlangt der Job 2K/4K,
+        automatisch auf das große Modell wechseln (nur für diesen Aufruf)."""
+        model = self.config.image_model
+        size = clean_string(image_size).upper() or LITE_ONLY_IMAGE_SIZE
+        if "lite" in model.lower() and size != LITE_ONLY_IMAGE_SIZE:
+            logging.info(
+                "Bildgröße %s > 1K — nutze %s statt %s für diesen Aufruf.",
+                size, FULL_IMAGE_MODEL, model)
+            return FULL_IMAGE_MODEL
+        return model
+
     def generate_image(
         self,
         prompt: str,
         aspect_ratio: str,
+        image_size: str = "",
         reference_images: Optional[List[Path]] = None,
     ) -> Image.Image:
         parts: List[Any] = [prompt]
         for ref_path in reference_images or []:
             parts.append(Image.open(ref_path))
 
+        size = clean_string(image_size).upper() or self.config.image_size_default
         response = self._generate_with_retry(
             "Bildgenerierung",
-            model=self.config.image_model,
+            model=self._resolve_image_model(size),
             contents=parts,
             config=types.GenerateContentConfig(
                 response_modalities=["IMAGE"],
                 image_config=types.ImageConfig(
                     aspect_ratio=aspect_ratio,
-                    image_size=self.config.image_size_default,
+                    image_size=size,
                 ),
             ),
         )
@@ -1085,8 +1120,16 @@ def run_job(
     if not base_output_dir.exists():
         raise FileNotFoundError(f"Output-Ordner für Job {job.job_id} existiert nicht: {base_output_dir}")
 
-    candidates_dir = ensure_dir(base_output_dir / "candidates")
-    selected_dir = ensure_dir(base_output_dir / "selected")
+    # Mit QC: Varianten nach candidates/, das beste Bild nach selected/.
+    # Ohne QC: ALLE erstellten Bilder in einen gemeinsamen Ordner images/.
+    if job.qc_enabled:
+        candidates_dir = ensure_dir(base_output_dir / "candidates")
+        selected_dir = ensure_dir(base_output_dir / "selected")
+    else:
+        candidates_dir = ensure_dir(base_output_dir / "images")
+        selected_dir = None
+        logging.info("[%s] Qualitätskontrolle AUS — alle Bilder landen in %s",
+                     job.job_id, candidates_dir)
     metadata_dir = ensure_dir(base_output_dir / "metadata")
 
     job_items = prepare_items_for_job(job, content_items, gemini, style)
@@ -1135,6 +1178,7 @@ def run_job(
                     image = gemini.generate_image(
                         prompt=item_prompt,
                         aspect_ratio=job.aspect_ratio,
+                        image_size=job.image_size,
                         reference_images=item_reference_paths,
                     )
                 except Exception as e:
@@ -1156,6 +1200,17 @@ def run_job(
                 file_stem = item.output_name_hint or slugify(item.title or item.item_id)
                 final_image_path = candidates_dir / f"{item.item_id}_{file_stem}_v{variant_idx:02d}_try{attempt:02d}.png"
                 save_image(image, final_image_path)
+
+                if not job.qc_enabled:
+                    # QC ausgeschaltet: Bild ist gespeichert, keine Bewertung.
+                    qc_payload = {}
+                    qc_score = 0.0
+                    qc_decision = "qc_off"
+                    qc_reason = ""
+                    logging.info("[%s | %s] Variante %s gespeichert (QC aus): %s",
+                                 job.job_id, item.item_id, variant_idx,
+                                 final_image_path.name)
+                    break
 
                 qc_payload = gemini.qc_image(
                     image_path=final_image_path,
@@ -1218,44 +1273,53 @@ def run_job(
             logging.warning("[%s | %s] Keine Kandidaten erzeugt", job.job_id, item.item_id)
             continue
 
-        best = sorted(
-            candidate_results,
-            key=lambda r: (
-                1 if r.qc_decision == "accept" else 0,
-                r.qc_score,
-            ),
-            reverse=True,
-        )[0]
-
-        selected_name = f"{item.item_id}_{slugify(item.title or item.item_id)}_BEST.png"
-        selected_path = selected_dir / selected_name
-        shutil.copy2(best.image_path, selected_path)
-
         item_meta = {
             "job_id": job.job_id,
             "job_name": job.job_name,
             "item_id": item.item_id,
             "item_title": item.title,
             "source_text_or_topic": item.source_text_or_topic,
-            "selected_image": str(selected_path),
-            "selected_from_candidate": str(best.image_path),
-            "selected_score": best.qc_score,
-            "selected_decision": best.qc_decision,
-            "selected_reason": best.qc_reason,
-            "prompt": best.prompt,
-            "all_candidates": [
-                {
-                    "variant_index": c.variant_index,
-                    "image_path": str(c.image_path),
-                    "qc_score": c.qc_score,
-                    "qc_decision": c.qc_decision,
-                    "qc_reason": c.qc_reason,
-                    "qc_details": c.qc_details,
-                }
-                for c in candidate_results
-            ],
+            "qc_enabled": job.qc_enabled,
+            "prompt": candidate_results[0].prompt,
             "created_at": datetime.now().isoformat(timespec="seconds"),
         }
+
+        if job.qc_enabled:
+            # Bestes Bild wählen und nach selected/ kopieren.
+            best = sorted(
+                candidate_results,
+                key=lambda r: (
+                    1 if r.qc_decision == "accept" else 0,
+                    r.qc_score,
+                ),
+                reverse=True,
+            )[0]
+
+            selected_name = f"{item.item_id}_{slugify(item.title or item.item_id)}_BEST.png"
+            selected_path = selected_dir / selected_name
+            shutil.copy2(best.image_path, selected_path)
+
+            item_meta.update({
+                "selected_image": str(selected_path),
+                "selected_from_candidate": str(best.image_path),
+                "selected_score": best.qc_score,
+                "selected_decision": best.qc_decision,
+                "selected_reason": best.qc_reason,
+                "all_candidates": [
+                    {
+                        "variant_index": c.variant_index,
+                        "image_path": str(c.image_path),
+                        "qc_score": c.qc_score,
+                        "qc_decision": c.qc_decision,
+                        "qc_reason": c.qc_reason,
+                        "qc_details": c.qc_details,
+                    }
+                    for c in candidate_results
+                ],
+            })
+        else:
+            # QC aus: keine Auswahl — alle Bilder gleichwertig in images/.
+            item_meta["images"] = [str(c.image_path) for c in candidate_results]
         meta_path = metadata_dir / f"{item.item_id}.json"
         meta_path.write_text(json.dumps(item_meta, ensure_ascii=False, indent=2), encoding="utf-8")
 

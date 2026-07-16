@@ -839,6 +839,8 @@ class ImageGeneratorApp(ctk.CTk):
         j = lambda *parts: "  ·  ".join([p for p in parts if _clean(p)])
         if sheet == sa.SHEET_JOBS:
             tc = _clean(r.get("target_count"))
+            qc_off = _clean(r.get("qc_enabled")).lower() in {
+                "nein", "no", "false", "0", "aus", "off"}
             return (
                 _clean(r.get("job_id")), _clean(r.get("job_name")),
                 j(_clean(r.get("job_type")),
@@ -846,6 +848,7 @@ class ImageGeneratorApp(ctk.CTk):
                   f"Template: {_clean(r.get('prompt_template_id'))}" if _clean(r.get("prompt_template_id")) else "",
                   _clean(r.get("aspect_ratio")),
                   f"{tc} Bilder" if tc else "",
+                  "QC aus" if qc_off else "",
                   _shorten(r.get("output_folder"), 40)))
         if sheet == sa.SHEET_ITEMS:
             return (
@@ -1062,12 +1065,21 @@ class ImageGeneratorApp(ctk.CTk):
                  "default": tpl_default("default_aspect_ratio", "1:1")},
                 {"key": "image_size", "label": "Bildgröße", "type": "option",
                  "values": IMAGE_SIZES,
-                 "default": tpl_default("default_image_size", "2K")},
+                 "default": tpl_default("default_image_size", "1K"),
+                 "help": "1K nutzt das schnelle, günstige Lite-Bildmodell. "
+                         "Bei 2K/4K wechselt das Skript automatisch auf das große Modell."},
+                {"key": "qc_enabled", "label": "Qualitätskontrolle", "type": "option",
+                 "values": ["ja", "nein"], "default": "ja",
+                 "transform": lambda v: v.lower(),
+                 "help": "ja: KI bewertet jede Variante und legt das beste Bild in "
+                         "selected/ ab. nein: spart Zeit & Tokens — alle Bilder "
+                         "landen unbewertet im Ordner images/."},
                 {"key": "target_count", "label": "Zielanzahl Bilder", "type": "int",
                  "help": "Bei content_linked leer lassen — dann zählt die Anzahl der Inhalte"},
                 {"key": "variants_per_item", "label": "Varianten pro Motiv",
                  "type": "int", "default": "2",
-                 "help": "Wie viele Kandidaten pro Motiv erzeugt werden (QC wählt den besten)"},
+                 "help": "Wie viele Kandidaten pro Motiv erzeugt werden. Ohne "
+                         "Qualitätskontrolle reicht meist 1 (keine Auswahl nötig)."},
             ]},
             {"title": "Ausgabe & Status", "fields": [
                 {"key": "output_folder", "label": "Ausgabeordner", "type": "entry",
@@ -1294,7 +1306,8 @@ class ImageGeneratorApp(ctk.CTk):
                  "type": "option", "values": ASPECT_RATIOS, "default": "1:1",
                  "help": "Wird im Job-Assistenten als Vorschlag übernommen"},
                 {"key": "default_image_size", "label": "Standard-Bildgröße",
-                 "type": "option", "values": IMAGE_SIZES, "default": "2K"},
+                 "type": "option", "values": IMAGE_SIZES, "default": "1K",
+                 "help": "1K nutzt das schnelle Lite-Bildmodell; 2K/4K das große Modell"},
             ]},
             {"title": "Prompt", "fields": [
                 {"key": "prompt_template", "label": "Prompt-Vorlage (EN)",

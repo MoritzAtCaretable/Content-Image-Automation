@@ -40,7 +40,7 @@ CANONICAL_COLUMNS: Dict[str, List[str]] = {
         "job_id", "status", "job_type", "job_name", "asset_goal",
         "source_collection", "style_preset_id", "prompt_template_id",
         "aspect_ratio", "image_size", "target_count", "variants_per_item",
-        "output_folder", "notes",
+        "output_folder", "notes", "qc_enabled",
     ],
     SHEET_ITEMS: [
         "item_id", "job_id", "content_type", "title",
