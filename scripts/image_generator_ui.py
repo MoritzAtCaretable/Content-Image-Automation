@@ -330,7 +330,7 @@ class StepDialog(ctk.CTkToplevel):
         current = self._current_value(f)
         widget = None
 
-        if t in ("entry", "int", "kuerzel", "files"):
+        if t in ("entry", "int", "kuerzel", "files", "folder"):
             row = ctk.CTkFrame(box, fg_color="transparent")
             row.pack(fill="x", pady=(2, 0))
             widget = ctk.CTkEntry(row)
@@ -340,6 +340,11 @@ class StepDialog(ctk.CTkToplevel):
                 ctk.CTkButton(row, text="Durchsuchen…", width=110,
                               fg_color=WINE, hover_color=WINE_HOVER,
                               command=lambda w=widget: self._browse_files(w)
+                              ).pack(side="left", padx=(8, 0))
+            if t == "folder":
+                ctk.CTkButton(row, text="Ordner wählen…", width=120,
+                              fg_color=WINE, hover_color=WINE_HOVER,
+                              command=lambda w=widget: self._browse_folder(w)
                               ).pack(side="left", padx=(8, 0))
             if t == "kuerzel" and self.id_preview:
                 preview = ctk.CTkLabel(box, text="", anchor="w",
@@ -408,6 +413,26 @@ class StepDialog(ctk.CTkToplevel):
         joined = "; ".join(([cur] if cur else []) + rels)
         entry.delete(0, "end")
         entry.insert(0, joined)
+
+    def _browse_folder(self, entry: ctk.CTkEntry):
+        """Finder-Dialog zum Wählen ODER Neu-Anlegen des Ausgabeordners.
+        Der native macOS-Dialog hat unten links 'Neuer Ordner'."""
+        cur = entry.get().strip()
+        outputs = self.app.project_root / "outputs"
+        start = self.app.project_root / cur if cur else outputs
+        if not start.is_dir():
+            start = outputs if outputs.is_dir() else self.app.project_root
+        chosen = filedialog.askdirectory(
+            parent=self, title="Ausgabeordner wählen (oder unten 'Neuer Ordner')",
+            initialdir=str(start), mustexist=False)
+        if not chosen:
+            return
+        try:
+            rel = str(Path(chosen).relative_to(self.app.project_root))
+        except ValueError:
+            rel = chosen   # außerhalb des Projekts → absoluter Pfad
+        entry.delete(0, "end")
+        entry.insert(0, rel)
 
     def _read_widget(self, f, widget) -> str:
         if widget is None:
@@ -1082,9 +1107,10 @@ class ImageGeneratorApp(ctk.CTk):
                          "Qualitätskontrolle reicht meist 1 (keine Auswahl nötig)."},
             ]},
             {"title": "Ausgabe & Status", "fields": [
-                {"key": "output_folder", "label": "Ausgabeordner", "type": "entry",
+                {"key": "output_folder", "label": "Ausgabeordner", "type": "folder",
                  "default": folder_default, "required": True,
-                 "help": "Relativ zum Projektordner, z. B. outputs/food_demo"},
+                 "help": "Über 'Ordner wählen…' auswählen oder neu anlegen. Existiert "
+                         "der Pfad beim Generieren nicht, wird er automatisch erstellt."},
                 {"key": "status", "label": "Status", "type": "option",
                  "values": STATUS_VALUES, "default": "todo",
                  "help": "todo/redo wird vom Skript verarbeitet — done wird übersprungen"},

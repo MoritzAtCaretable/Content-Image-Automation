@@ -85,6 +85,7 @@ class StylePreset:
     avoid: str = ""
     ui_safe: str = ""
     extra_notes: str = ""
+    reference_images: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -327,12 +328,43 @@ def safe_json_extract(text: str) -> Dict[str, Any]:
 
 
 
+def _resolve_reference_path(name: str, reference_root: Path) -> Optional[Path]:
+    """Findet ein Referenzbild tolerant — egal ob im Sheet 'foo.png',
+    'references/foo.png' oder ein absoluter Pfad steht."""
+    name = clean_string(name)
+    if not name:
+        return None
+    p = Path(name).expanduser()
+    candidates: List[Path] = []
+    if p.is_absolute():
+        candidates.append(p)
+    else:
+        candidates.append(reference_root / name)          # foo.png unter references/
+        candidates.append(reference_root.parent / name)   # references/foo.png ab Projektwurzel
+        candidates.append(Path.cwd() / name)
+        stripped = re.sub(r"^\.?/*references/+", "", name)  # führendes references/ entfernen
+        if stripped != name:
+            candidates.append(reference_root / stripped)
+    seen = set()
+    for c in candidates:
+        try:
+            rc = c.resolve()
+        except Exception:
+            continue
+        if rc in seen:
+            continue
+        seen.add(rc)
+        if rc.exists() and rc.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS:
+            return rc
+    return None
+
+
 def list_reference_images(reference_root: Path, requested_files: Iterable[str]) -> List[Path]:
     paths: List[Path] = []
     for file_name in requested_files:
-        candidate = (reference_root / file_name).resolve()
-        if candidate.exists() and candidate.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS:
-            paths.append(candidate)
+        resolved = _resolve_reference_path(file_name, reference_root)
+        if resolved is not None:
+            paths.append(resolved)
         else:
             logging.warning("Referenzbild nicht gefunden oder kein unterstütztes Format: %s", file_name)
     return paths
@@ -633,6 +665,7 @@ def parse_styles(df: pd.DataFrame) -> Dict[str, StylePreset]:
             avoid=first_non_empty(row, "avoid", "negative_style_prompt"),
             ui_safe=first_non_empty(row, "ui_safe", "ui_safe_area"),
             extra_notes=" | ".join([part for part in [use_case, maturity_level, notes] if part]),
+            reference_images=parse_csv(first_non_empty(row, "reference_images", "reference_files")),
         )
     return styles
 
@@ -1117,8 +1150,12 @@ def run_job(
     base_output_dir = Path(job.output_folder)
     if not base_output_dir.is_absolute():
         base_output_dir = (Path.cwd() / base_output_dir).resolve()
+    # Sicherer Fallback: fehlenden Output-Ordner anlegen statt abzubrechen
+    # (z. B. wenn der Pfad nur ins Sheet getippt wurde).
     if not base_output_dir.exists():
-        raise FileNotFoundError(f"Output-Ordner für Job {job.job_id} existiert nicht: {base_output_dir}")
+        logging.info("[%s] Output-Ordner existiert nicht — wird angelegt: %s",
+                     job.job_id, base_output_dir)
+    ensure_dir(base_output_dir)
 
     # Mit QC: Varianten nach candidates/, das beste Bild nach selected/.
     # Ohne QC: ALLE erstellten Bilder in einen gemeinsamen Ordner images/.
@@ -1134,7 +1171,16 @@ def run_job(
 
     job_items = prepare_items_for_job(job, content_items, gemini, style)
 
+    # Referenzbilder, die an JEDES Motiv dieses Jobs mitgegeben werden:
+    # zuerst die Stil-Anker aus dem Style Preset, dann job-weite Referenzen.
+    # Item-eigene Referenzen kommen weiter unten pro Motiv dazu.
+    style_reference_paths = list_reference_images(config.references_dir, style.reference_images)
     job_reference_paths = list_reference_images(config.references_dir, job.reference_files)
+    base_reference_paths = list(dict.fromkeys(style_reference_paths + job_reference_paths))
+    if base_reference_paths:
+        logging.info("[%s] %s Referenzbild(er) werden pro Motiv als Stilvorlage "
+                     "mitgegeben: %s", job.job_id, len(base_reference_paths),
+                     ", ".join(p.name for p in base_reference_paths))
     queue_rows: List[List[Any]] = []
     results_summary: List[Dict[str, Any]] = []
     # Schutzschalter: einzelne fehlgeschlagene Varianten werden übersprungen,
@@ -1147,7 +1193,9 @@ def run_job(
         logging.info("[%s] Bearbeite Item %s/%s: %s", job.job_id, item_index, len(job_items), item.title)
 
         item_prompt = render_prompt(template=template, style=style, item=item, job=job)
-        item_reference_paths = job_reference_paths + list_reference_images(config.references_dir, item.reference_files)
+        item_reference_paths = list(dict.fromkeys(
+            base_reference_paths
+            + list_reference_images(config.references_dir, item.reference_files)))
 
         candidate_results: List[CandidateResult] = []
         variant_count = max(1, job.variants_per_item or config.default_variants_per_item)
