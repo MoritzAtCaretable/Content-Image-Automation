@@ -55,6 +55,7 @@ SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 
 @dataclass
 class AppConfig:
+    project_root: Path
     gemini_api_key: str
     google_sheet_id: str
     google_service_account_file: str
@@ -146,7 +147,13 @@ class CandidateResult:
 
 
 def load_config() -> AppConfig:
-    load_dotenv()
+    configured_root = os.getenv("CIA_PROJECT_ROOT", "").strip()
+    project_root = (
+        Path(configured_root).expanduser().resolve()
+        if configured_root
+        else Path(__file__).resolve().parent.parent
+    )
+    load_dotenv(project_root / ".env")
 
     gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
     google_sheet_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
@@ -159,13 +166,22 @@ def load_config() -> AppConfig:
     if not google_service_account_file:
         raise ValueError("GOOGLE_SERVICE_ACCOUNT_FILE fehlt in .env")
 
-    references_dir = Path(os.getenv("REFERENCE_DIR", "references")).expanduser().resolve()
-    outputs_dir = Path(os.getenv("OUTPUT_DIR", "outputs")).expanduser().resolve()
+    references_dir = Path(os.getenv("REFERENCE_DIR", "references")).expanduser()
+    outputs_dir = Path(os.getenv("OUTPUT_DIR", "outputs")).expanduser()
+    if not references_dir.is_absolute():
+        references_dir = (project_root / references_dir).resolve()
+    if not outputs_dir.is_absolute():
+        outputs_dir = (project_root / outputs_dir).resolve()
+
+    service_account_path = Path(google_service_account_file).expanduser()
+    if not service_account_path.is_absolute():
+        service_account_path = (project_root / service_account_path).resolve()
 
     return AppConfig(
+        project_root=project_root,
         gemini_api_key=gemini_api_key,
         google_sheet_id=google_sheet_id,
-        google_service_account_file=google_service_account_file,
+        google_service_account_file=str(service_account_path),
         references_dir=references_dir,
         outputs_dir=outputs_dir,
         image_model=os.getenv("IMAGE_MODEL", DEFAULT_IMAGE_MODEL),
@@ -1149,7 +1165,7 @@ def run_job(
 
     base_output_dir = Path(job.output_folder)
     if not base_output_dir.is_absolute():
-        base_output_dir = (Path.cwd() / base_output_dir).resolve()
+        base_output_dir = (config.project_root / base_output_dir).resolve()
     # Sicherer Fallback: fehlenden Output-Ordner anlegen statt abzubrechen
     # (z. B. wenn der Pfad nur ins Sheet getippt wurde).
     if not base_output_dir.exists():

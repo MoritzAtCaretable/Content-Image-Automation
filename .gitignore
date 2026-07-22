@@ -16,6 +16,8 @@ outputs/
 
 # ── macOS App-Bundle (wird lokal vom Installer gebaut) ──
 Content Image Automation.app/
+build/
+dist/
 
 # ── Python-Cache ──
 __pycache__/

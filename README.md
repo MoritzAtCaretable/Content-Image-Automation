@@ -49,6 +49,36 @@ installiert alle Pakete und baut `Content Image Automation.app`. Bei einem
 ZIP-Download stellt es zusätzlich die Git-Verbindung her (ohne vorhandene
 Dateien zu löschen).
 
+### Firmen-DMG für Apple Silicon bauen
+
+Der ARM-Build enthält Python und alle benötigten Pakete. Beim ersten Start wird
+der mitgelieferte Git-Checkout samt `.env` und `service_account.json` nach
+`~/Library/Application Support/Caretable/Content Image Automation/project`
+kopiert. Dadurch bleibt die Update-Funktion über `git pull` erhalten.
+
+Einmalig die Build-Abhängigkeit installieren:
+```
+.venv/bin/python -m pip install -r requirements-build.txt
+```
+
+Danach die DMG bauen:
+```
+chmod +x scripts/build_macos_arm64_dmg.sh
+./scripts/build_macos_arm64_dmg.sh
+```
+
+Das Ergebnis liegt unter
+`dist/macos-arm64/Content-Image-Automation-arm64.dmg`. Die App ist nicht mit
+einer Developer-ID signiert oder notarisiert. Auf dem Ziel-Mac muss sie deshalb
+beim ersten Start über Rechtsklick → „Öffnen“ beziehungsweise in
+„Datenschutz & Sicherheit“ erlaubt werden.
+
+Der Build muss aus einem sauberen, veröffentlichten Git-Stand erfolgen. Neue
+reine Python-Quellversionen können anschließend über den Update-Button geladen
+werden. Kommen neue Python-Pakete hinzu oder ändert sich der Bootstrap, muss
+eine neue DMG gebaut werden. Git selbst muss auf dem Ziel-Mac verfügbar und für
+das private Repository authentifiziert sein.
+
 ### Windows
 
 Doppelklick auf **`install.bat`**.

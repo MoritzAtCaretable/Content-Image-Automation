@@ -118,6 +118,9 @@ def _apply_wine_theme() -> None:
 
 def find_project_root() -> Path:
     """Works when this file is in project/scripts or project root."""
+    configured = os.getenv("CIA_PROJECT_ROOT", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
     here = Path(__file__).resolve()
     candidates = [here.parent, here.parent.parent, Path.cwd()]
     for candidate in candidates:
@@ -406,7 +409,10 @@ class StepDialog(ctk.CTkToplevel):
         rels = []
         for p in paths:
             try:
-                rels.append(str(Path(p).relative_to(self.app.project_root)))
+                # Sheet values are relative to REFERENCE_DIR, not to the
+                # project root.  Existing values with a leading "references/"
+                # remain supported by the generator for backwards compatibility.
+                rels.append(str(Path(p).relative_to(initial)))
             except ValueError:
                 rels.append(p)
         cur = entry.get().strip()
@@ -523,7 +529,12 @@ class ImageGeneratorApp(ctk.CTk):
         self.project_root = find_project_root()
         self.env_path = self.project_root / ".env"
         self.generator_script = self.project_root / "scripts" / "generate_images.py"
-        self.venv_python = self.project_root / ".venv" / "bin" / "python"
+        self.frozen = bool(getattr(sys, "frozen", False))
+        self.venv_python = (
+            Path(sys.executable)
+            if self.frozen
+            else self.project_root / ".venv" / "bin" / "python"
+        )
         self.process: subprocess.Popen[str] | None = None
         self.log_queue: queue.Queue[str] = queue.Queue()
         self._ui_queue: queue.Queue = queue.Queue()
@@ -1521,7 +1532,11 @@ class ImageGeneratorApp(ctk.CTk):
             self._refresh_status()
             return
 
-        cmd = [str(self.venv_python), str(self.generator_script)]
+        cmd = (
+            [str(self.venv_python), "--run-pipeline"]
+            if self.frozen
+            else [str(self.venv_python), str(self.generator_script)]
+        )
 
         self._append_log("\n" + "=" * 60)
         self._append_log("Starte Generierungsprozess …")
@@ -1653,8 +1668,11 @@ class ImageGeneratorApp(ctk.CTk):
     def _restart_app(self) -> None:
         """Startet die laufende UI neu, damit die aktualisierte Version greift."""
         try:
-            script = os.path.abspath(__file__)
-            os.execv(sys.executable, [sys.executable, script])
+            if self.frozen:
+                os.execv(sys.executable, [sys.executable])
+            else:
+                script = os.path.abspath(__file__)
+                os.execv(sys.executable, [sys.executable, script])
         except Exception as e:
             messagebox.showinfo(
                 "Update",
@@ -1758,8 +1776,12 @@ class ImageGeneratorApp(ctk.CTk):
                 missing.append(f"{key} in .env")
 
         service_account = env.get("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
-        if service_account and not Path(service_account).expanduser().exists():
-            missing.append(f"Service-Account-Datei nicht gefunden: {service_account}")
+        if service_account:
+            service_path = Path(service_account).expanduser()
+            if not service_path.is_absolute():
+                service_path = self.project_root / service_path
+            if not service_path.exists():
+                missing.append(f"Service-Account-Datei nicht gefunden: {service_path}")
 
         return missing
 
