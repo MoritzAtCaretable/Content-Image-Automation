@@ -1,12 +1,40 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
 from pathlib import Path
 
+from PyInstaller import compat
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
 
 
 ROOT = Path.cwd()
 SEED = ROOT / "build" / "macos-arm64" / "project_seed"
+PYTHON_FRAMEWORK = (
+    ROOT
+    / ".build-tools"
+    / "python-3.13.13"
+    / "runtime"
+    / "Python.framework"
+    / "Versions"
+    / "3.13"
+)
+
+# PyInstaller launches probe processes through Apple's ``arch`` command. It
+# forwards DYLD_LIBRARY_PATH itself, but not DYLD_FRAMEWORK_PATH, which is
+# required by the locally extracted official Python framework used for this
+# reproducible build.
+_original_wrap_python = compat.__wrap_python
+
+
+def _wrap_python_with_framework_path(args, kwargs):
+    cmdargs, kwargs = _original_wrap_python(args, kwargs)
+    framework_path = os.environ.get("DYLD_FRAMEWORK_PATH")
+    if framework_path and cmdargs and cmdargs[0] == "arch":
+        cmdargs[2:2] = ["-e", f"DYLD_FRAMEWORK_PATH={framework_path}"]
+    return cmdargs, kwargs
+
+
+compat.__wrap_python = _wrap_python_with_framework_path
 
 hiddenimports = [
     "customtkinter",
@@ -28,6 +56,10 @@ for package in ("google.auth", "google.genai"):
 
 datas = [(str(SEED), "project_seed")]
 datas += collect_data_files("customtkinter")
+datas += [
+    (str(PYTHON_FRAMEWORK / "Frameworks" / "Tcl.framework" / "Versions" / "8.6" / "Resources" / "Scripts"), "_tcl_data"),
+    (str(PYTHON_FRAMEWORK / "Frameworks" / "Tk.framework" / "Versions" / "8.6" / "Resources" / "Scripts"), "_tk_data"),
+]
 for distribution in (
     "google-genai",
     "google-auth",
@@ -40,10 +72,18 @@ for distribution in (
 ):
     datas += copy_metadata(distribution)
 
+binaries = [
+    (str(PYTHON_FRAMEWORK / "lib" / "libcrypto.3.dylib"), "."),
+    (str(PYTHON_FRAMEWORK / "lib" / "libssl.3.dylib"), "."),
+    (str(PYTHON_FRAMEWORK / "lib" / "libncurses.6.dylib"), "."),
+    (str(PYTHON_FRAMEWORK / "Frameworks" / "Tcl.framework" / "Versions" / "8.6" / "Tcl"), "."),
+    (str(PYTHON_FRAMEWORK / "Frameworks" / "Tk.framework" / "Versions" / "8.6" / "Tk"), "."),
+]
+
 a = Analysis(
     [str(ROOT / "scripts" / "frozen_bootstrap.py")],
     pathex=[str(ROOT / "scripts")],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

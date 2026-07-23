@@ -10,6 +10,8 @@ service_account*.json
 # ── Virtuelle Umgebung ──
 .venv/
 venv/
+.venv-build-3.13/
+.build-tools/
 
 # ── Generierte Bilder & Metadaten ──
 outputs/

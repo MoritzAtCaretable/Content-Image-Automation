@@ -12,7 +12,9 @@ import json
 import os
 import runpy
 import shutil
+import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 
@@ -24,6 +26,7 @@ APP_SUPPORT = (
     / "Content Image Automation"
 )
 PROJECT_ROOT = APP_SUPPORT / "project"
+LOG_FILE = Path.home() / "Library" / "Logs" / "ContentImageAutomation.log"
 
 
 def _bundle_root() -> Path:
@@ -90,4 +93,13 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LOG_FILE.write_text(traceback.format_exc(), encoding="utf-8")
+        # Opening the log in the default text editor is more reliable than an
+        # AppleScript dialog and still makes GUI-launch failures immediately
+        # visible to non-technical users.
+        subprocess.run(["open", str(LOG_FILE)], check=False)
+        raise SystemExit(1) from exc

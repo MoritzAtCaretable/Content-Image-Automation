@@ -56,9 +56,10 @@ der mitgelieferte Git-Checkout samt `.env` und `service_account.json` nach
 `~/Library/Application Support/Caretable/Content Image Automation/project`
 kopiert. Dadurch bleibt die Update-Funktion über `git pull` erhalten.
 
-Einmalig die Build-Abhängigkeit installieren:
+Einmalig die kompatible Build-Laufzeit und alle Build-Abhängigkeiten vorbereiten:
 ```
-.venv/bin/python -m pip install -r requirements-build.txt
+chmod +x scripts/setup_macos_build_python.sh
+./scripts/setup_macos_build_python.sh
 ```
 
 Danach die DMG bauen:
@@ -66,6 +67,11 @@ Danach die DMG bauen:
 chmod +x scripts/build_macos_arm64_dmg.sh
 ./scripts/build_macos_arm64_dmg.sh
 ```
+
+Der Build verwendet bewusst den offiziellen Python-3.13-macOS-Build statt
+Homebrew-Python. Homebrew-Python kann auf einem neuen Build-Mac eine zu hohe
+macOS-Mindestversion in die App tragen. Das Buildskript bricht ab, sobald eine
+eingebettete Binärdatei mehr als macOS 11 verlangt.
 
 Das Ergebnis liegt unter
 `dist/macos-arm64/Content-Image-Automation-arm64.dmg`. Die App ist nicht mit
