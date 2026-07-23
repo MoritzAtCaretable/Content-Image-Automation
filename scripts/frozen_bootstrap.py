@@ -43,8 +43,14 @@ def _install_project_if_needed() -> None:
     shutil.copytree(seed, PROJECT_ROOT)
 
 
+def _ensure_writable_directories() -> None:
+    for directory_name in ("outputs", "references"):
+        (PROJECT_ROOT / directory_name).mkdir(parents=True, exist_ok=True)
+
+
 def main() -> None:
     _install_project_if_needed()
+    _ensure_writable_directories()
     os.environ["CIA_PROJECT_ROOT"] = str(PROJECT_ROOT)
     os.chdir(PROJECT_ROOT)
     scripts_dir = PROJECT_ROOT / "scripts"
@@ -57,6 +63,8 @@ def main() -> None:
             PROJECT_ROOT / "scripts" / "generate_images.py",
             PROJECT_ROOT / "secrets" / "service_account.json",
             PROJECT_ROOT / ".git",
+            PROJECT_ROOT / "outputs",
+            PROJECT_ROOT / "references",
         ]
         missing = [str(path) for path in required if not path.exists()]
         import_errors = {}
