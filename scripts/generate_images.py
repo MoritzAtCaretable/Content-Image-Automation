@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -45,6 +46,10 @@ SCOPES = [
 DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-lite-image"
 FULL_IMAGE_MODEL = "gemini-3.1-flash-image"     # Nano Banana 2
 LITE_ONLY_IMAGE_SIZE = "1K"
+RESTORATION_MODEL_MAX_SIZE = {
+    DEFAULT_IMAGE_MODEL: "1K",
+    FULL_IMAGE_MODEL: "4K",
+}
 DEFAULT_PLANNER_MODEL = "gemini-3.5-flash"
 DEFAULT_QC_MODEL = "gemini-3.1-flash-lite"
 ALLOWED_JOB_STATUSES = {"todo", "redo"}
@@ -137,6 +142,8 @@ class Job:
     qc_enabled: bool = True       # Sheet-Spalte qc_enabled (ja/nein); leer = ja
     restore_source_folder: str = ""
     restore_prompt: str = ""
+    restore_model: str = DEFAULT_IMAGE_MODEL
+    restore_transparency_background: str = "green"
 
 
 @dataclass
@@ -417,28 +424,53 @@ def closest_supported_aspect_ratio(width: int, height: int) -> str:
     return min(SUPPORTED_ASPECT_RATIOS, key=distance)
 
 
-def restoration_model_size(width: int, height: int) -> str:
-    """Waehlt ausreichend Modellaufloesung, bevor exakt auf die
-    Originalabmessungen zurueckgerechnet wird."""
-    longest_edge = max(width, height)
-    if longest_edge <= 1400:
-        return "1K"
-    if longest_edge <= 2800:
-        return "2K"
-    return "4K"
+def restoration_model_size(model: str) -> str:
+    """Nutzt immer die groesste vom gewaehlten Modell unterstuetzte
+    Bildgroesse."""
+    return RESTORATION_MODEL_MAX_SIZE.get(clean_string(model), "1K")
 
 
-def normalize_restored_image(image: Image.Image, width: int,
-                             height: int) -> Image.Image:
-    """Normalisiert das generierte Ergebnis auf exakt dieselbe Pixelmatrix
-    wie das visuell ausgerichtete Originalbild."""
+def crop_to_source_aspect_ratio(image: Image.Image, width: int,
+                                height: int) -> Image.Image:
+    """Schneidet mittig und ohne Verzerrung auf das exakte Quellverhaeltnis.
+
+    Gemini akzeptiert nur eine begrenzte Menge von Seitenverhaeltnissen. Nach
+    der Generierung wird daher lediglich der kleine Ueberstand des
+    naechstpassenden Modellformats entfernt. Die maximal erzeugte Aufloesung
+    bleibt erhalten; es wird nicht auf die alten Pixelmasse verkleinert.
+    """
     if width <= 0 or height <= 0:
-        raise ValueError("Ungueltige Zielabmessungen fuer Restaurierung")
-    normalized = image.convert("RGB")
-    if normalized.size != (width, height):
-        normalized = normalized.resize(
-            (width, height), Image.Resampling.LANCZOS)
-    return normalized
+        raise ValueError("Ungueltiges Seitenverhaeltnis fuer Restaurierung")
+    restored = image.convert("RGB")
+    divisor = math.gcd(width, height)
+    ratio_width = width // divisor
+    ratio_height = height // divisor
+    multiplier = min(restored.width // ratio_width,
+                     restored.height // ratio_height)
+    if multiplier <= 0:
+        raise ValueError(
+            "Das generierte Bild ist zu klein fuer das Quell-Seitenverhaeltnis")
+    crop_width = ratio_width * multiplier
+    crop_height = ratio_height * multiplier
+    left = (restored.width - crop_width) // 2
+    top = (restored.height - crop_height) // 2
+    box = (left, top, left + crop_width, top + crop_height)
+    return restored.crop(box)
+
+
+def flatten_transparency(image: Image.Image, background: str) -> Image.Image:
+    """Legt transparente Bereiche kontrolliert auf Weiss oder Chroma-Gruen.
+
+    Eine direkte RGB-Konvertierung wuerde transparente Pixel schwarz machen.
+    Das ist fuer spaeteres Freistellen unguenstig.
+    """
+    rgba = image.convert("RGBA")
+    if rgba.getextrema()[3] == (255, 255):
+        return rgba.convert("RGB")
+    color = (255, 255, 255, 255) if background == "white" else (0, 255, 0, 255)
+    canvas = Image.new("RGBA", rgba.size, color)
+    canvas.alpha_composite(rgba)
+    return canvas.convert("RGB")
 
 
 def save_restored_image(image: Image.Image, path: Path) -> None:
@@ -714,6 +746,10 @@ def parse_jobs(df: pd.DataFrame, config: AppConfig) -> List[Job]:
         status = clean_string(row.get("status")).lower()
         if status not in ALLOWED_JOB_STATUSES:
             continue
+        restore_background = clean_string(
+            row.get("restore_transparency_background")).lower()
+        if restore_background not in {"green", "white"}:
+            restore_background = "green"
 
         job = Job(
             job_id=clean_string(row.get("job_id")),
@@ -735,6 +771,9 @@ def parse_jobs(df: pd.DataFrame, config: AppConfig) -> List[Job]:
             qc_enabled=parse_bool(row.get("qc_enabled"), default=True),
             restore_source_folder=clean_string(row.get("restore_source_folder")),
             restore_prompt=clean_string(row.get("restore_prompt")),
+            restore_model=(clean_string(row.get("restore_model"))
+                           or DEFAULT_IMAGE_MODEL),
+            restore_transparency_background=restore_background,
         )
         jobs.append(job)
     return jobs
@@ -1073,16 +1112,21 @@ extra_notes: {style.extra_notes}
         aspect_ratio: str,
         image_size: str = "",
         reference_images: Optional[List[Path]] = None,
+        model_override: str = "",
+        transparency_background: str = "green",
     ) -> Image.Image:
         parts: List[Any] = [prompt]
         for ref_path in reference_images or []:
             with Image.open(ref_path) as ref:
-                parts.append(ImageOps.exif_transpose(ref).convert("RGB").copy())
+                oriented = ImageOps.exif_transpose(ref)
+                parts.append(flatten_transparency(
+                    oriented, transparency_background).copy())
 
         size = clean_string(image_size).upper() or self.config.image_size_default
+        model = clean_string(model_override) or self._resolve_image_model(size)
         response = self._generate_with_retry(
             "Bildgenerierung",
-            model=self._resolve_image_model(size),
+            model=model,
             contents=parts,
             config=types.GenerateContentConfig(
                 response_modalities=["IMAGE"],
@@ -1221,7 +1265,9 @@ Output fields:
         try:
             with Image.open(source_path) as source_raw, \
                     Image.open(restored_path) as restored_raw:
-                source = ImageOps.exif_transpose(source_raw).convert("RGB").copy()
+                source = flatten_transparency(
+                    ImageOps.exif_transpose(source_raw),
+                    job.restore_transparency_background).copy()
                 restored = restored_raw.convert("RGB").copy()
             response = self._generate_with_retry(
                 f"Restaurierungs-QC {restored_path.name}",
@@ -1291,8 +1337,10 @@ all requested content constraints intact:
 
     technical = f"""
 The FIRST provided image is the authoritative source image.
-Required final canvas: exactly {item.source_width} x {item.source_height} pixels.
-Required source aspect ratio: {item.source_width}:{item.source_height}.
+Preserve the exact source aspect ratio {item.source_width}:{item.source_height}.
+Generate at the highest resolution supported by the selected model.
+The original pixel dimensions {item.source_width} x {item.source_height} are
+reference dimensions only and must not limit the output resolution.
 Preserve the full frame and do not change the orientation.
 {style_instruction}
 """.strip()
@@ -1493,13 +1541,13 @@ def run_job(
                 + base_reference_paths))
             generation_aspect_ratio = closest_supported_aspect_ratio(
                 item.source_width, item.source_height)
-            generation_image_size = restoration_model_size(
-                item.source_width, item.source_height)
+            generation_model = job.restore_model or DEFAULT_IMAGE_MODEL
+            generation_image_size = restoration_model_size(generation_model)
             logging.info(
-                "[%s | %s] Restaurierung %sx%s -> Modell %s/%s; "
-                "Finale Abmessungen bleiben exakt erhalten.",
+                "[%s | %s] Restaurierung %sx%s -> %s, Format %s/%s; "
+                "Ausgabe behaelt das exakte Seitenverhaeltnis bei maximaler Aufloesung.",
                 job.job_id, item.item_id, item.source_width, item.source_height,
-                generation_aspect_ratio, generation_image_size)
+                generation_model, generation_aspect_ratio, generation_image_size)
         else:
             if template is None:  # nur fuer den Type-Checker; oben validiert
                 raise ValueError(f"Prompt Template für Job {job.job_id} fehlt")
@@ -1510,6 +1558,7 @@ def run_job(
                 + list_reference_images(config.references_dir, item.reference_files)))
             generation_aspect_ratio = job.aspect_ratio
             generation_image_size = job.image_size
+            generation_model = ""
 
         candidate_results: List[CandidateResult] = []
         variant_count = max(1, job.variants_per_item or config.default_variants_per_item)
@@ -1542,6 +1591,10 @@ def run_job(
                         aspect_ratio=generation_aspect_ratio,
                         image_size=generation_image_size,
                         reference_images=item_reference_paths,
+                        model_override=generation_model,
+                        transparency_background=(
+                            job.restore_transparency_background
+                            if is_restoration else "green"),
                     )
                 except Exception as e:
                     consecutive_failures += 1
@@ -1561,7 +1614,7 @@ def run_job(
 
                 file_stem = item.output_name_hint or slugify(item.title or item.item_id)
                 if is_restoration:
-                    image = normalize_restored_image(
+                    image = crop_to_source_aspect_ratio(
                         image, item.source_width, item.source_height)
                     relative_parent = Path(item.source_relative_path).parent
                     extension = (item.source_extension
@@ -1668,13 +1721,18 @@ def run_job(
             "created_at": datetime.now().isoformat(timespec="seconds"),
         }
         if is_restoration:
+            with Image.open(candidate_results[0].image_path) as restored_meta_image:
+                restored_dimensions = list(restored_meta_image.size)
             item_meta.update({
                 "source_image": item.source_image_path,
                 "source_relative_path": item.source_relative_path,
                 "source_dimensions": [item.source_width, item.source_height],
-                "final_dimensions": [item.source_width, item.source_height],
+                "source_aspect_ratio": f"{item.source_width}:{item.source_height}",
+                "final_dimensions": restored_dimensions,
                 "model_aspect_ratio": generation_aspect_ratio,
                 "model_image_size": generation_image_size,
+                "restoration_model": generation_model,
+                "transparency_background": job.restore_transparency_background,
                 "style_mode": (style.style_preset_id
                                if job.style_preset_id else "original_source_style"),
             })

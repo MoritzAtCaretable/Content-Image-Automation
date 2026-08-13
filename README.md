@@ -148,9 +148,12 @@ wenn ein Style/Template noch von Jobs verwendet wird.
   pro Witz). Inhalte lassen sich beim Anlegen des Jobs direkt miterfassen.
 - **`image_restore`** — alle PNG-, JPG- und WebP-Bilder eines gewählten
   Ordners originalgetreu neu erzeugen. Unterordner bleiben erhalten; jedes
-  Ergebnis wird auf exakt dieselben Pixelmaße wie sein Ausgangsbild gebracht.
-  Standardmäßig bleibt der individuelle Originalstil erhalten. Optional kann
-  ein Style Preset den Look des gesamten Jobs vereinheitlichen. Der
+  Ergebnis behält das exakte Seitenverhältnis seines Ausgangsbildes, wird aber
+  in der größtmöglichen Auflösung des gewählten Modells erzeugt. Das Lite-Modell
+  liefert maximal 1K, das große Flash-Modell maximal 4K. Standardmäßig bleibt
+  der individuelle Originalstil erhalten. Optional kann ein Style Preset den
+  Look des gesamten Jobs vereinheitlichen. Transparente PNG-Bereiche werden
+  wahlweise auf Chroma-Grün oder Weiß statt auf Schwarz gelegt. Der
   Restaurierungs-Standardprompt lässt sich pro Job vollständig anpassen, etwa
   um gezielt Gegenstände zu entfernen oder andere Änderungen anzufordern.
 
@@ -158,8 +161,8 @@ Bei `image_restore` vergleicht die optionale Qualitätskontrolle Original und
 Ergebnis gemeinsam. Sie bewertet insbesondere Bildaufbau, Geometrie,
 Detailqualität, Artefakte und ausdrücklich angeforderte Änderungen. Die App
 wählt Modellauflösung und das nächstpassende unterstützte Seitenverhältnis
-automatisch; der finale Export verwendet wieder die exakten Abmessungen und
-das Dateiformat des Ausgangsbildes.
+automatisch; der finale Export schneidet ohne Verzerrung auf das exakte
+Original-Seitenverhältnis zu und verwendet das Dateiformat des Ausgangsbildes.
 
 Pro Motiv erzeugt das Skript mehrere Varianten (`variants_per_item`), bewertet
 sie per QC und legt die beste in den Output-Ordner des Jobs.

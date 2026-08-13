@@ -16,6 +16,8 @@ from generate_images import (  # noqa: E402
     AppConfig,
     Job,
     closest_supported_aspect_ratio,
+    crop_to_source_aspect_ratio,
+    flatten_transparency,
     original_image_style,
     prepare_restoration_items,
     render_restoration_prompt,
@@ -86,8 +88,10 @@ class FakeGemini:
         self.qc_calls = []
 
     def generate_image(self, prompt, aspect_ratio, image_size,
-                       reference_images):
-        self.calls.append((prompt, aspect_ratio, image_size, reference_images))
+                       reference_images, model_override="",
+                       transparency_background="green"):
+        self.calls.append((prompt, aspect_ratio, image_size, reference_images,
+                           model_override, transparency_background))
         return Image.new("RGB", (1024, 1024), (90, 120, 150))
 
     def qc_restoration(self, source_path, restored_path, prompt, style, job):
@@ -97,12 +101,28 @@ class FakeGemini:
 
 
 class ImageRestoreTests(unittest.TestCase):
-    def test_ratio_and_model_size_are_derived_from_source(self):
+    def test_ratio_and_maximum_size_are_derived_from_model(self):
         self.assertEqual(closest_supported_aspect_ratio(1920, 1080), "16:9")
         self.assertEqual(closest_supported_aspect_ratio(1080, 1920), "9:16")
-        self.assertEqual(restoration_model_size(1000, 800), "1K")
-        self.assertEqual(restoration_model_size(2400, 1600), "2K")
-        self.assertEqual(restoration_model_size(4000, 3000), "4K")
+        self.assertEqual(restoration_model_size("gemini-3.1-flash-lite-image"),
+                         "1K")
+        self.assertEqual(restoration_model_size("gemini-3.1-flash-image"),
+                         "4K")
+
+    def test_output_uses_largest_exact_source_ratio_without_stretching(self):
+        restored = crop_to_source_aspect_ratio(
+            Image.new("RGB", (1024, 1536)), 277, 429)
+        self.assertEqual(restored.size, (831, 1287))
+        self.assertEqual(restored.width * 429, restored.height * 277)
+
+    def test_transparency_uses_green_or_white_instead_of_black(self):
+        transparent = Image.new("RGBA", (2, 2), (0, 0, 0, 0))
+        transparent.putpixel((1, 1), (200, 10, 20, 255))
+        green = flatten_transparency(transparent, "green")
+        white = flatten_transparency(transparent, "white")
+        self.assertEqual(green.getpixel((0, 0)), (0, 255, 0))
+        self.assertEqual(white.getpixel((0, 0)), (255, 255, 255))
+        self.assertEqual(green.getpixel((1, 1)), (200, 10, 20))
 
     def test_source_scan_is_recursive_and_preserves_dimensions(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -137,7 +157,8 @@ class ImageRestoreTests(unittest.TestCase):
         default_prompt = render_restoration_prompt(
             original_image_style(), content, make_job("in", "out"))
         self.assertIn("Do not add, remove", default_prompt)
-        self.assertIn("exactly 800 x 600 pixels", default_prompt)
+        self.assertIn("exact source aspect ratio 800:600", default_prompt)
+        self.assertIn("must not limit the output resolution", default_prompt)
 
         custom_job = make_job("in", "out",
                               restore_prompt="Remove the cable, keep everything else.")
@@ -146,7 +167,7 @@ class ImageRestoreTests(unittest.TestCase):
         self.assertIn("Remove the cable", custom_prompt)
         self.assertNotIn("Do not add, remove", custom_prompt)
 
-    def test_pipeline_writes_exact_source_dimensions_and_preserves_subfolders(self):
+    def test_pipeline_writes_max_resolution_at_exact_ratio_and_preserves_subfolders(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "input" / "set_a"
@@ -168,17 +189,23 @@ class ImageRestoreTests(unittest.TestCase):
             selected = root / "output" / "selected" / "set_a" / "foto_RESTORED.jpg"
             self.assertTrue(selected.exists())
             with Image.open(selected) as image:
-                self.assertEqual(image.size, (321, 197))
+                self.assertEqual(image.size, (963, 591))
+                self.assertEqual(image.width * 197, image.height * 321)
             self.assertEqual(gemini.calls[0][1], "3:2")
             self.assertEqual(gemini.calls[0][2], "1K")
-            self.assertEqual(gemini.qc_calls[0][2], (321, 197))
+            self.assertEqual(gemini.calls[0][4],
+                             "gemini-3.1-flash-lite-image")
+            self.assertEqual(gemini.calls[0][5], "green")
+            self.assertEqual(gemini.qc_calls[0][2], (963, 591))
             self.assertEqual(workbook.jobs.status, "done")
             self.assertEqual(result["items_processed"], 1)
 
             metadata = root / "output" / "metadata" / "set_a" / "foto.json"
             payload = json.loads(metadata.read_text(encoding="utf-8"))
             self.assertEqual(payload["source_dimensions"], [321, 197])
-            self.assertEqual(payload["final_dimensions"], [321, 197])
+            self.assertEqual(payload["final_dimensions"], [963, 591])
+            self.assertEqual(payload["restoration_model"],
+                             "gemini-3.1-flash-lite-image")
 
 
 if __name__ == "__main__":

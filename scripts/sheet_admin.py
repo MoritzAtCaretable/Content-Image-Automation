@@ -41,7 +41,7 @@ CANONICAL_COLUMNS: Dict[str, List[str]] = {
         "source_collection", "style_preset_id", "prompt_template_id",
         "aspect_ratio", "image_size", "target_count", "variants_per_item",
         "output_folder", "notes", "qc_enabled", "restore_source_folder",
-        "restore_prompt",
+        "restore_prompt", "restore_model", "restore_transparency_background",
     ],
     SHEET_ITEMS: [
         "item_id", "job_id", "content_type", "title",

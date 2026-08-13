@@ -80,6 +80,10 @@ STATUS_VALUES = ["todo", "redo", "done"]
 ASPECT_RATIOS = ["1:1", "9:16", "16:9", "4:3", "3:4", "3:2", "2:3", "21:9"]
 IMAGE_SIZES = ["1K", "2K", "4K"]
 DEFAULT_MODEL = "gemini-3.1-flash-image"
+RESTORATION_MODELS = [
+    "gemini-3.1-flash-lite-image",
+    "gemini-3.1-flash-image",
+]
 CONTENT_TYPES = ["joke", "batch_seed", "fact", "tip", "quote"]
 MATURITY_SUGGESTIONS = ["playful_but_mature", "premium", "adult_friendly", "neutral"]
 # Platzhalter, die generate_images.render_prompt ersetzt (einfache {klammern})
@@ -1221,6 +1225,18 @@ class ImageGeneratorApp(ctk.CTk):
             {"title": "Restaurierungsqualität",
              "skip": lambda dlg: selected_job_type(dlg) != "image_restore",
              "fields": [
+                {"key": "restore_model", "label": "Restaurierungsmodell",
+                 "type": "option", "values": RESTORATION_MODELS,
+                 "default": RESTORATION_MODELS[0],
+                 "help": "Die App nutzt automatisch die größte unterstützte "
+                         "Auflösung: gemini-3.1-flash-lite-image bis 1K, "
+                         "gemini-3.1-flash-image bis 4K."},
+                {"key": "restore_transparency_background",
+                 "label": "Hintergrund für transparente PNGs", "type": "option",
+                 "values": ["green", "white"], "default": "green",
+                 "help": "green: Chroma-Grün zum einfachen Entfernen · white: Weiß. "
+                         "Nur transparente Bereiche werden ersetzt; schwarze Flächen "
+                         "im eigentlichen Bild bleiben unverändert."},
                 {"key": "qc_enabled", "label": "Originalvergleich", "type": "option",
                  "values": ["ja", "nein"], "default": "ja",
                  "transform": lambda v: v.lower(),
