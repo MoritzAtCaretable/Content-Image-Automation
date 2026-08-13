@@ -37,6 +37,8 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
+from restoration_defaults import DEFAULT_RESTORATION_PROMPT, ORIGINAL_STYLE_OPTION
+
 try:
     from dotenv import dotenv_values
 except Exception:
@@ -73,7 +75,7 @@ STATUS_COLORS = {"todo": WINE, "redo": "#b45309", "done": ("gray55", "gray45")}
 # ---------------------------------------------------------------------------
 # Auswahlwerte für die Assistenten (aus Sheet-Beispielen + Pipeline abgeleitet)
 # ---------------------------------------------------------------------------
-JOB_TYPES = ["batch_theme", "content_linked"]
+JOB_TYPES = ["batch_theme", "content_linked", "image_restore"]
 STATUS_VALUES = ["todo", "redo", "done"]
 ASPECT_RATIOS = ["1:1", "9:16", "16:9", "4:3", "3:4", "3:2", "2:3", "21:9"]
 IMAGE_SIZES = ["1K", "2K", "4K"]
@@ -86,7 +88,8 @@ PLACEHOLDERS = [
     "{job_name}", "{job_type}", "{aspect_ratio}", "{preset_name}",
     "{visual_style}", "{color_palette}", "{composition_rules}",
     "{ui_safe_area}", "{positive_style_prompt}", "{negative_style_prompt}",
-    "{notes}",
+    "{notes}", "{source_filename}", "{source_width}", "{source_height}",
+    "{source_dimensions}",
 ]
 
 PLACEHOLDER_MENU_TEXT = "Platzhalter einfügen …"
@@ -156,7 +159,7 @@ class StepDialog(ctk.CTkToplevel):
        "summary": fn(dialog) -> [(label, wert)]}   # Beitrag zur Zusammenfassung
 
     Feld-Dict:
-      {"key", "label", "type": entry|int|text|option|combo|kuerzel|files,
+      {"key", "label", "type": entry|int|text|option|combo|kuerzel|files|folder|input_folder,
        "values": [..] | fn(dialog)->[..], "default": str | fn(dialog)->str,
        "required": bool, "help": str, "height": int, "transform": fn(str)->str,
        "placeholders": bool (Textfeld bekommt Platzhalter-Menü),
@@ -333,7 +336,7 @@ class StepDialog(ctk.CTkToplevel):
         current = self._current_value(f)
         widget = None
 
-        if t in ("entry", "int", "kuerzel", "files", "folder"):
+        if t in ("entry", "int", "kuerzel", "files", "folder", "input_folder"):
             row = ctk.CTkFrame(box, fg_color="transparent")
             row.pack(fill="x", pady=(2, 0))
             widget = ctk.CTkEntry(row)
@@ -348,6 +351,11 @@ class StepDialog(ctk.CTkToplevel):
                 ctk.CTkButton(row, text="Ordner wählen…", width=120,
                               fg_color=WINE, hover_color=WINE_HOVER,
                               command=lambda w=widget: self._browse_folder(w)
+                              ).pack(side="left", padx=(8, 0))
+            if t == "input_folder":
+                ctk.CTkButton(row, text="Bilderordner wählen…", width=150,
+                              fg_color=WINE, hover_color=WINE_HOVER,
+                              command=lambda w=widget: self._browse_input_folder(w)
                               ).pack(side="left", padx=(8, 0))
             if t == "kuerzel" and self.id_preview:
                 preview = ctk.CTkLabel(box, text="", anchor="w",
@@ -439,6 +447,25 @@ class StepDialog(ctk.CTkToplevel):
             rel = chosen   # außerhalb des Projekts → absoluter Pfad
         entry.delete(0, "end")
         entry.insert(0, rel)
+
+    def _browse_input_folder(self, entry: ctk.CTkEntry):
+        cur = entry.get().strip()
+        start = Path(cur).expanduser() if cur else self.app.project_root
+        if not start.is_absolute():
+            start = self.app.project_root / start
+        if not start.is_dir():
+            start = self.app.project_root
+        chosen = filedialog.askdirectory(
+            parent=self, title="Ordner mit zu restaurierenden Bildern wählen",
+            initialdir=str(start), mustexist=True)
+        if not chosen:
+            return
+        try:
+            value = str(Path(chosen).relative_to(self.app.project_root))
+        except ValueError:
+            value = chosen
+        entry.delete(0, "end")
+        entry.insert(0, value)
 
     def _read_widget(self, f, widget) -> str:
         if widget is None:
@@ -877,13 +904,16 @@ class ImageGeneratorApp(ctk.CTk):
             tc = _clean(r.get("target_count"))
             qc_off = _clean(r.get("qc_enabled")).lower() in {
                 "nein", "no", "false", "0", "aus", "off"}
+            is_restore = _clean(r.get("job_type")) == "image_restore"
             return (
                 _clean(r.get("job_id")), _clean(r.get("job_name")),
                 j(_clean(r.get("job_type")),
                   f"Style: {_clean(r.get('style_preset_id'))}" if _clean(r.get("style_preset_id")) else "",
-                  f"Template: {_clean(r.get('prompt_template_id'))}" if _clean(r.get("prompt_template_id")) else "",
-                  _clean(r.get("aspect_ratio")),
-                  f"{tc} Bilder" if tc else "",
+                  (f"Template: {_clean(r.get('prompt_template_id'))}"
+                   if not is_restore and _clean(r.get("prompt_template_id")) else ""),
+                  (_shorten(r.get("restore_source_folder"), 36)
+                   if is_restore else _clean(r.get("aspect_ratio"))),
+                  f"{tc} Bilder" if tc and not is_restore else "",
                   "QC aus" if qc_off else "",
                   _shorten(r.get("output_folder"), 40)))
         if sheet == sa.SHEET_ITEMS:
@@ -1049,6 +1079,11 @@ class ImageGeneratorApp(ctk.CTk):
         style_opts = [f"{_clean(r.get('style_preset_id'))} — {_clean(r.get('preset_name'))}"
                       for r in styles_tbl.records if _clean(r.get("style_preset_id"))]
 
+        def selected_job_type(dlg):
+            return (_clean(dlg.values.get("job_type"))
+                    or _clean(dlg.initial.get("job_type"))
+                    or "batch_theme")
+
         def tpl_opts(dlg):
             jt = _clean(dlg.values.get("job_type"))
             rows = [r for r in tpl_tbl.records if _clean(r.get("prompt_template_id"))]
@@ -1070,23 +1105,60 @@ class ImageGeneratorApp(ctk.CTk):
             slug = re.sub(r"[^a-z0-9]+", "_", name).strip("_") or "job"
             return f"outputs/{slug}"
 
+        def validate_basics(dlg):
+            if (selected_job_type(dlg) != "image_restore"
+                    and not _clean(dlg.values.get("asset_goal"))):
+                return "Bitte „Ziel / Beschreibung“ ausfüllen."
+            return ""
+
+        def validate_restore_source(dlg):
+            value = _clean(dlg.values.get("restore_source_folder"))
+            if not value:
+                return "Bitte einen Ordner mit Ausgangsbildern auswählen."
+            path = Path(value).expanduser()
+            if not path.is_absolute():
+                path = self.project_root / path
+            if not path.is_dir():
+                return f"Der gewählte Bilderordner wurde nicht gefunden:\n{path}"
+            if not any(p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+                       for p in path.rglob("*")):
+                return "Der gewählte Ordner enthält keine PNG-, JPG- oder WebP-Bilder."
+            return ""
+
+        def validate_output(dlg):
+            if selected_job_type(dlg) != "image_restore":
+                return ""
+            source = Path(_clean(dlg.values.get("restore_source_folder"))).expanduser()
+            output = Path(_clean(dlg.values.get("output_folder"))).expanduser()
+            if not source.is_absolute():
+                source = self.project_root / source
+            if not output.is_absolute():
+                output = self.project_root / output
+            if source.resolve() == output.resolve():
+                return "Quell- und Ausgabeordner dürfen nicht identisch sein."
+            return ""
+
         steps = [
-            {"title": "Grundlagen", "fields": [
+            {"title": "Grundlagen", "validate": validate_basics, "fields": [
                 {"key": "job_type", "label": "Job-Typ", "type": "option",
                  "values": JOB_TYPES, "default": "batch_theme",
                  "help": "batch_theme: das Skript plant Motive zum Thema selbst · "
-                         "content_linked: genau ein Bild pro Content Item (z. B. pro Witz)"},
+                         "content_linked: genau ein Bild pro Content Item · "
+                         "image_restore: vorhandene Bilder originalgetreu restaurieren"},
                 {"key": "job_name", "label": "Job-Name", "type": "entry",
                  "required": True,
                  "help": "Kurzer, sprechender Name — z. B. „Food Content Demo“"},
                 {"key": "asset_goal", "label": "Ziel / Beschreibung", "type": "text",
-                 "height": 70, "required": True,
-                 "help": "Was soll entstehen? Z. B. „80 hochwertige Food-Bilder für Social/Web“"},
+                 "height": 70,
+                 "help": "Bei batch_theme/content_linked erforderlich. Bei image_restore "
+                         "optional; der Restaurierungszweck wird automatisch ergänzt."},
                 {"key": "source_collection", "label": "Quelle (source_collection)",
                  "type": "entry", "default": "manual_briefing",
                  "help": "Frei wählbarer Sammlungsname, z. B. manual_briefing oder jokes_batch_01"},
             ]},
-            {"title": "Stil & Vorlage", "fields": [
+            {"title": "Stil & Vorlage",
+             "skip": lambda dlg: selected_job_type(dlg) == "image_restore",
+             "fields": [
                 {"key": "style_preset_id", "label": "Style Preset", "type": "option",
                  "values": style_opts, "required": True, "transform": self._strip_id,
                  "help": "Wiederverwendbare Stilregeln — verwalten im Tab „Styles“"},
@@ -1095,7 +1167,36 @@ class ImageGeneratorApp(ctk.CTk):
                  "transform": self._strip_id,
                  "help": "Vorlage für den finalen Prompt — passend zum Job-Typ vorgefiltert"},
             ]},
-            {"title": "Bildparameter", "fields": [
+            {"title": "Ausgangsbilder",
+             "skip": lambda dlg: selected_job_type(dlg) != "image_restore",
+             "validate": validate_restore_source,
+             "fields": [
+                {"key": "restore_source_folder", "label": "Ordner mit Ausgangsbildern",
+                 "type": "input_folder", "required": True,
+                 "help": "Alle PNG-, JPG- und WebP-Bilder werden inklusive "
+                         "Unterordnern verarbeitet. Der Ausgabeordner wird automatisch "
+                         "vom erneuten Einlesen ausgeschlossen."},
+            ]},
+            {"title": "Restaurierung & optionaler Stil",
+             "skip": lambda dlg: selected_job_type(dlg) != "image_restore",
+             "fields": [
+                {"key": "style_preset_id", "label": "Einheitlicher Stil (optional)",
+                 "type": "option", "values": [ORIGINAL_STYLE_OPTION] + style_opts,
+                 "default": ORIGINAL_STYLE_OPTION,
+                 "transform": lambda v: ("" if v == ORIGINAL_STYLE_OPTION
+                                         else self._strip_id(v)),
+                 "help": "Originalstil behält den individuellen Look jedes Bildes bei. "
+                         "Ein Style Preset vereinheitlicht den Look des gesamten Ordners."},
+                {"key": "restore_prompt", "label": "Restaurierungsanweisung",
+                 "type": "text", "height": 300, "required": True,
+                 "default": DEFAULT_RESTORATION_PROMPT,
+                 "help": "Der Standard rekonstruiert das Bild möglichst exakt und "
+                         "verbessert nur Details, Linien und Schärfe. Für gewünschte "
+                         "Entfernungen oder Änderungen kann der Text vollständig angepasst werden."},
+            ]},
+            {"title": "Bildparameter",
+             "skip": lambda dlg: selected_job_type(dlg) == "image_restore",
+             "fields": [
                 {"key": "aspect_ratio", "label": "Seitenverhältnis", "type": "option",
                  "values": ASPECT_RATIOS,
                  "default": tpl_default("default_aspect_ratio", "1:1")},
@@ -1117,7 +1218,20 @@ class ImageGeneratorApp(ctk.CTk):
                  "help": "Wie viele Kandidaten pro Motiv erzeugt werden. Ohne "
                          "Qualitätskontrolle reicht meist 1 (keine Auswahl nötig)."},
             ]},
-            {"title": "Ausgabe & Status", "fields": [
+            {"title": "Restaurierungsqualität",
+             "skip": lambda dlg: selected_job_type(dlg) != "image_restore",
+             "fields": [
+                {"key": "qc_enabled", "label": "Originalvergleich", "type": "option",
+                 "values": ["ja", "nein"], "default": "ja",
+                 "transform": lambda v: v.lower(),
+                 "help": "Empfohlen: Original und Restaurierung werden gemeinsam auf "
+                         "Komposition, Geometrie, Detailqualität und gewünschte Änderungen geprüft."},
+                {"key": "variants_per_item", "label": "Varianten pro Bild",
+                 "type": "int", "default": "2",
+                 "help": "Mit zwei oder drei Varianten kann der Originalvergleich das "
+                         "treueste Ergebnis auswählen."},
+            ]},
+            {"title": "Ausgabe & Status", "validate": validate_output, "fields": [
                 {"key": "output_folder", "label": "Ausgabeordner", "type": "folder",
                  "default": folder_default, "required": True,
                  "help": "Über 'Ordner wählen…' auswählen oder neu anlegen. Existiert "
@@ -1129,7 +1243,7 @@ class ImageGeneratorApp(ctk.CTk):
             ]},
             {"title": "Inhalte",
              "skip": lambda dlg: (rec is not None
-                                  or _clean(dlg.values.get("job_type")) != "content_linked"),
+                                  or selected_job_type(dlg) != "content_linked"),
              "builder": self._build_items_step,
              "summary": lambda dlg: [("Neue Inhalte",
                                       str(len(dlg.extra.get("items", []))))]},
@@ -1220,6 +1334,11 @@ class ImageGeneratorApp(ctk.CTk):
 
     def _save_job(self, dlg: StepDialog) -> None:
         values = {k: v for k, v in dlg.values.items() if not k.startswith("_")}
+        if values.get("job_type") == "image_restore" and not _clean(values.get("asset_goal")):
+            values["asset_goal"] = (
+                "Ausgangsbilder originalgetreu rekonstruieren und Details, "
+                "Linien sowie Schaerfe verbessern"
+            )
         items = list(dlg.extra.get("items", []))
 
         def work():

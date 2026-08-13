@@ -20,7 +20,9 @@ from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 from google.oauth2.service_account import Credentials
-from PIL import Image
+from PIL import Image, ImageOps
+
+from restoration_defaults import DEFAULT_RESTORATION_PROMPT
 
 # -----------------------------------------------------------------------------
 # Configuration / constants
@@ -47,6 +49,7 @@ DEFAULT_PLANNER_MODEL = "gemini-3.5-flash"
 DEFAULT_QC_MODEL = "gemini-3.1-flash-lite"
 ALLOWED_JOB_STATUSES = {"todo", "redo"}
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+SUPPORTED_ASPECT_RATIOS = ("1:1", "9:16", "16:9", "4:3", "3:4", "3:2", "2:3", "21:9")
 
 
 # -----------------------------------------------------------------------------
@@ -107,6 +110,11 @@ class ContentItem:
     notes: str = ""
     reference_files: List[str] = field(default_factory=list)
     output_name_hint: str = ""
+    source_image_path: str = ""
+    source_relative_path: str = ""
+    source_width: int = 0
+    source_height: int = 0
+    source_extension: str = ".png"
 
 
 @dataclass
@@ -127,6 +135,8 @@ class Job:
     batch_seed_topics: str = ""
     image_size: str = ""          # leer = DEFAULT_IMAGE_SIZE aus der .env
     qc_enabled: bool = True       # Sheet-Spalte qc_enabled (ja/nein); leer = ja
+    restore_source_folder: str = ""
+    restore_prompt: str = ""
 
 
 @dataclass
@@ -386,6 +396,129 @@ def list_reference_images(reference_root: Path, requested_files: Iterable[str]) 
     return paths
 
 
+def resolve_job_path(value: str, project_root: Path) -> Path:
+    path = Path(clean_string(value)).expanduser()
+    if not path.is_absolute():
+        path = project_root / path
+    return path.resolve()
+
+
+def closest_supported_aspect_ratio(width: int, height: int) -> str:
+    """Liefert das vom Bildmodell unterstuetzte Verhaeltnis mit der
+    geringsten Abweichung zum Quellbild."""
+    if width <= 0 or height <= 0:
+        return "1:1"
+    source_ratio = width / height
+
+    def distance(label: str) -> float:
+        left, right = label.split(":", 1)
+        return abs(source_ratio - (float(left) / float(right)))
+
+    return min(SUPPORTED_ASPECT_RATIOS, key=distance)
+
+
+def restoration_model_size(width: int, height: int) -> str:
+    """Waehlt ausreichend Modellaufloesung, bevor exakt auf die
+    Originalabmessungen zurueckgerechnet wird."""
+    longest_edge = max(width, height)
+    if longest_edge <= 1400:
+        return "1K"
+    if longest_edge <= 2800:
+        return "2K"
+    return "4K"
+
+
+def normalize_restored_image(image: Image.Image, width: int,
+                             height: int) -> Image.Image:
+    """Normalisiert das generierte Ergebnis auf exakt dieselbe Pixelmatrix
+    wie das visuell ausgerichtete Originalbild."""
+    if width <= 0 or height <= 0:
+        raise ValueError("Ungueltige Zielabmessungen fuer Restaurierung")
+    normalized = image.convert("RGB")
+    if normalized.size != (width, height):
+        normalized = normalized.resize(
+            (width, height), Image.Resampling.LANCZOS)
+    return normalized
+
+
+def save_restored_image(image: Image.Image, path: Path) -> None:
+    """Speichert im Quellformat mit hochwertigen Exportparametern."""
+    ensure_dir(path.parent)
+    suffix = path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        image.convert("RGB").save(path, format="JPEG", quality=95,
+                                  subsampling=0, optimize=True)
+    elif suffix == ".webp":
+        image.convert("RGB").save(path, format="WEBP", quality=95, method=6)
+    else:
+        image.convert("RGB").save(path, format="PNG", optimize=True)
+
+
+def prepare_restoration_items(job: Job, config: AppConfig) -> List[ContentItem]:
+    source_root = resolve_job_path(job.restore_source_folder,
+                                   config.project_root)
+    if not source_root.is_dir():
+        raise ValueError(
+            f"Quellordner fuer Restaurierung nicht gefunden: {source_root}")
+
+    output_root = resolve_job_path(job.output_folder, config.project_root)
+    if output_root == source_root:
+        raise ValueError(
+            "Quell- und Ausgabeordner duerfen bei einer Restaurierung nicht identisch sein.")
+    try:
+        output_is_inside_source = output_root.is_relative_to(source_root)
+    except (OSError, ValueError):
+        output_is_inside_source = False
+    source_paths: List[Path] = []
+    for path in source_root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
+            continue
+        relative = path.relative_to(source_root)
+        if any(part.startswith(".") for part in relative.parts):
+            continue
+        try:
+            if output_is_inside_source and path.resolve().is_relative_to(output_root):
+                continue
+        except (OSError, ValueError):
+            pass
+        source_paths.append(path)
+
+    source_paths.sort(key=lambda p: p.relative_to(source_root).as_posix().lower())
+    if not source_paths:
+        raise ValueError(
+            f"Im Quellordner wurden keine PNG-, JPG- oder WebP-Bilder gefunden: {source_root}")
+
+    items: List[ContentItem] = []
+    for idx, source_path in enumerate(source_paths, start=1):
+        relative = source_path.relative_to(source_root)
+        try:
+            with Image.open(source_path) as raw:
+                oriented = ImageOps.exif_transpose(raw)
+                width, height = oriented.size
+        except Exception as exc:
+            logging.warning("Ungueltiges Quellbild wird uebersprungen: %s (%s)",
+                            source_path, exc)
+            continue
+        items.append(ContentItem(
+            item_id=f"{job.job_id}_RESTORE_{idx:04d}",
+            job_id=job.job_id,
+            content_type="image_restore",
+            title=relative.as_posix(),
+            source_text_or_topic=f"Originalgetreue Restaurierung von {relative.name}",
+            reference_files=[str(source_path.resolve())],
+            output_name_hint=source_path.stem,
+            source_image_path=str(source_path.resolve()),
+            source_relative_path=relative.as_posix(),
+            source_width=width,
+            source_height=height,
+            source_extension=source_path.suffix.lower(),
+        ))
+
+    if not items:
+        raise ValueError("Alle gefundenen Quelldateien waren unlesbar.")
+    return items
+
+
 
 def pil_image_to_bytes(image: Image.Image, fmt: str = "PNG") -> bytes:
     from io import BytesIO
@@ -600,6 +733,8 @@ def parse_jobs(df: pd.DataFrame, config: AppConfig) -> List[Job]:
             image_size=clean_string(row.get("image_size")).upper()
                        or config.image_size_default,
             qc_enabled=parse_bool(row.get("qc_enabled"), default=True),
+            restore_source_folder=clean_string(row.get("restore_source_folder")),
+            restore_prompt=clean_string(row.get("restore_prompt")),
         )
         jobs.append(job)
     return jobs
@@ -787,6 +922,27 @@ QC_RESPONSE_SCHEMA = types.Schema(
     },
 )
 
+RESTORATION_QC_RESPONSE_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    required=["score", "decision", "reason"],
+    properties={
+        "score": types.Schema(type=types.Type.NUMBER),
+        "decision": types.Schema(type=types.Type.STRING,
+                                 enum=["accept", "retry", "reject"]),
+        "reason": types.Schema(type=types.Type.STRING),
+        "composition_fidelity": types.Schema(type=types.Type.NUMBER),
+        "geometry_fidelity": types.Schema(type=types.Type.NUMBER),
+        "detail_quality": types.Schema(type=types.Type.NUMBER),
+        "artifact_control": types.Schema(type=types.Type.NUMBER),
+        "style_match": types.Schema(type=types.Type.NUMBER),
+        "requested_changes": types.Schema(type=types.Type.NUMBER),
+        "issues": types.Schema(type=types.Type.ARRAY,
+                               items=types.Schema(type=types.Type.STRING)),
+        "strengths": types.Schema(type=types.Type.ARRAY,
+                                  items=types.Schema(type=types.Type.STRING)),
+    },
+)
+
 
 # HTTP-Status, bei denen sich Warten + erneut versuchen lohnt (Überlastung /
 # transiente Serverfehler / Rate-Limit). Alles andere ist ein echter Fehler.
@@ -920,7 +1076,8 @@ extra_notes: {style.extra_notes}
     ) -> Image.Image:
         parts: List[Any] = [prompt]
         for ref_path in reference_images or []:
-            parts.append(Image.open(ref_path))
+            with Image.open(ref_path) as ref:
+                parts.append(ImageOps.exif_transpose(ref).convert("RGB").copy())
 
         size = clean_string(image_size).upper() or self.config.image_size_default
         response = self._generate_with_retry(
@@ -1026,10 +1183,120 @@ Original prompt used:
             return {"score": 0, "decision": "accept",
                     "reason": f"QC fehlgeschlagen: {e}"}
 
+    def qc_restoration(
+        self,
+        source_path: Path,
+        restored_path: Path,
+        prompt: str,
+        style: StylePreset,
+        job: Job,
+    ) -> Dict[str, Any]:
+        qc_prompt = f"""
+You are comparing a SOURCE image and its RESTORED candidate.
+The first image is SOURCE. The second image is RESTORED.
+Return ONLY valid JSON.
+
+Judge the candidate against the exact restoration instruction. A standard
+restoration must preserve composition, crop, object positions, geometry,
+identity, colors and style while improving clarity and fine detail. If the
+instruction explicitly requests a removal or alteration, judge that requested
+change as correct rather than penalizing it.
+
+Use a strict score. Choose retry when another generation attempt could likely
+fix visible drift or artifacts. Reject severe structural changes.
+
+Job: {job.job_name}
+Instruction: {prompt}
+Optional style: {style.style_name if job.style_preset_id else "original source style"}
+
+Output fields:
+- score: 0-100
+- decision: accept | retry | reject
+- reason: concise explanation
+- composition_fidelity, geometry_fidelity, detail_quality, artifact_control,
+  style_match, requested_changes: each 0-100
+- issues: list
+- strengths: list
+""".strip()
+        try:
+            with Image.open(source_path) as source_raw, \
+                    Image.open(restored_path) as restored_raw:
+                source = ImageOps.exif_transpose(source_raw).convert("RGB").copy()
+                restored = restored_raw.convert("RGB").copy()
+            response = self._generate_with_retry(
+                f"Restaurierungs-QC {restored_path.name}",
+                model=self.config.qc_model,
+                contents=[qc_prompt, source, restored],
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    response_mime_type="application/json",
+                    response_schema=RESTORATION_QC_RESPONSE_SCHEMA,
+                ),
+            )
+            return safe_json_extract(getattr(response, "text", "") or "")
+        except Exception as e:
+            logging.warning(
+                "Restaurierungs-QC fuer %s fehlgeschlagen (%s) — Bild wird "
+                "zur manuellen Sichtung uebernommen.", restored_path.name, e)
+            return {"score": 0, "decision": "accept",
+                    "reason": f"Restaurierungs-QC fehlgeschlagen: {e}"}
+
 
 # -----------------------------------------------------------------------------
 # Prompt building / item preparation
 # -----------------------------------------------------------------------------
+
+
+def original_image_style() -> StylePreset:
+    return StylePreset(
+        style_preset_id="",
+        style_name="Originalstil",
+        style_description="Preserve the visual style of each source image.",
+    )
+
+
+def render_restoration_prompt(style: StylePreset, item: ContentItem,
+                              job: Job) -> str:
+    prompt = clean_string(job.restore_prompt) or DEFAULT_RESTORATION_PROMPT
+    replacements = {
+        "source_filename": Path(item.source_image_path).name,
+        "source_width": str(item.source_width),
+        "source_height": str(item.source_height),
+        "source_dimensions": f"{item.source_width}x{item.source_height}",
+        "job_name": job.job_name,
+        "asset_goal": job.asset_goal,
+        "notes": job.notes,
+    }
+    for key, value in replacements.items():
+        prompt = prompt.replace("{" + key + "}", value)
+
+    if job.style_preset_id:
+        style_instruction = f"""
+Apply this optional unifying style while keeping the source composition and
+all requested content constraints intact:
+- style: {style.style_name}
+- visual direction: {style.style_description}
+- tone: {style.tone}
+- colors: {style.color_palette}
+- composition rules: {style.composition}
+- include: {style.do_include}
+- avoid: {style.avoid}
+- notes: {style.extra_notes}
+""".strip()
+    else:
+        style_instruction = (
+            "Preserve the individual visual style, colors, lighting and "
+            "rendering character of this source image."
+        )
+
+    technical = f"""
+The FIRST provided image is the authoritative source image.
+Required final canvas: exactly {item.source_width} x {item.source_height} pixels.
+Required source aspect ratio: {item.source_width}:{item.source_height}.
+Preserve the full frame and do not change the orientation.
+{style_instruction}
+""".strip()
+    return f"{prompt.strip()}\n\nTechnical restoration constraints:\n{technical}"
 
 
 def render_prompt(template: PromptTemplate, style: StylePreset, item: ContentItem, job: Job) -> str:
@@ -1093,6 +1360,7 @@ def prepare_items_for_job(
     content_items: List[ContentItem],
     gemini: GeminiService,
     style: StylePreset,
+    config: AppConfig,
 ) -> List[ContentItem]:
     if job.job_type == "content_linked":
         items = [item for item in content_items if item.job_id == job.job_id]
@@ -1129,6 +1397,9 @@ def prepare_items_for_job(
             )
         return items
 
+    if job.job_type == "image_restore":
+        return prepare_restoration_items(job, config)
+
     raise ValueError(f"Unbekannter job_type für Job {job.job_id}: {job.job_type}")
 
 
@@ -1155,13 +1426,18 @@ def run_job(
     logging.info("=" * 80)
     logging.info("Starte Job %s | %s", job.job_id, job.job_name)
 
-    if job.style_preset_id not in styles:
+    is_restoration = job.job_type == "image_restore"
+
+    if job.style_preset_id and job.style_preset_id not in styles:
         raise ValueError(f"Style Preset {job.style_preset_id} für Job {job.job_id} nicht gefunden")
-    if job.prompt_template_id not in templates:
+    if not is_restoration and not job.style_preset_id:
+        raise ValueError(f"Style Preset für Job {job.job_id} fehlt")
+    if not is_restoration and job.prompt_template_id not in templates:
         raise ValueError(f"Prompt Template {job.prompt_template_id} für Job {job.job_id} nicht gefunden")
 
-    style = styles[job.style_preset_id]
-    template = templates[job.prompt_template_id]
+    style = (styles[job.style_preset_id]
+             if job.style_preset_id else original_image_style())
+    template = templates.get(job.prompt_template_id)
 
     base_output_dir = Path(job.output_folder)
     if not base_output_dir.is_absolute():
@@ -1185,7 +1461,7 @@ def run_job(
                      job.job_id, candidates_dir)
     metadata_dir = ensure_dir(base_output_dir / "metadata")
 
-    job_items = prepare_items_for_job(job, content_items, gemini, style)
+    job_items = prepare_items_for_job(job, content_items, gemini, style, config)
 
     # Referenzbilder, die an JEDES Motiv dieses Jobs mitgegeben werden:
     # zuerst die Stil-Anker aus dem Style Preset, dann job-weite Referenzen.
@@ -1208,10 +1484,32 @@ def run_job(
     for item_index, item in enumerate(job_items, start=1):
         logging.info("[%s] Bearbeite Item %s/%s: %s", job.job_id, item_index, len(job_items), item.title)
 
-        item_prompt = render_prompt(template=template, style=style, item=item, job=job)
-        item_reference_paths = list(dict.fromkeys(
-            base_reference_paths
-            + list_reference_images(config.references_dir, item.reference_files)))
+        if is_restoration:
+            item_prompt = render_restoration_prompt(style=style, item=item, job=job)
+            # Das Original muss als erste und damit autoritative Bildreferenz
+            # vor moeglichen Stilankern an das Modell gehen.
+            item_reference_paths = list(dict.fromkeys(
+                list_reference_images(config.references_dir, item.reference_files)
+                + base_reference_paths))
+            generation_aspect_ratio = closest_supported_aspect_ratio(
+                item.source_width, item.source_height)
+            generation_image_size = restoration_model_size(
+                item.source_width, item.source_height)
+            logging.info(
+                "[%s | %s] Restaurierung %sx%s -> Modell %s/%s; "
+                "Finale Abmessungen bleiben exakt erhalten.",
+                job.job_id, item.item_id, item.source_width, item.source_height,
+                generation_aspect_ratio, generation_image_size)
+        else:
+            if template is None:  # nur fuer den Type-Checker; oben validiert
+                raise ValueError(f"Prompt Template für Job {job.job_id} fehlt")
+            item_prompt = render_prompt(template=template, style=style,
+                                        item=item, job=job)
+            item_reference_paths = list(dict.fromkeys(
+                base_reference_paths
+                + list_reference_images(config.references_dir, item.reference_files)))
+            generation_aspect_ratio = job.aspect_ratio
+            generation_image_size = job.image_size
 
         candidate_results: List[CandidateResult] = []
         variant_count = max(1, job.variants_per_item or config.default_variants_per_item)
@@ -1241,8 +1539,8 @@ def run_job(
                 try:
                     image = gemini.generate_image(
                         prompt=item_prompt,
-                        aspect_ratio=job.aspect_ratio,
-                        image_size=job.image_size,
+                        aspect_ratio=generation_aspect_ratio,
+                        image_size=generation_image_size,
                         reference_images=item_reference_paths,
                     )
                 except Exception as e:
@@ -1262,8 +1560,21 @@ def run_job(
                 consecutive_failures = 0
 
                 file_stem = item.output_name_hint or slugify(item.title or item.item_id)
-                final_image_path = candidates_dir / f"{item.item_id}_{file_stem}_v{variant_idx:02d}_try{attempt:02d}.png"
-                save_image(image, final_image_path)
+                if is_restoration:
+                    image = normalize_restored_image(
+                        image, item.source_width, item.source_height)
+                    relative_parent = Path(item.source_relative_path).parent
+                    extension = (item.source_extension
+                                 if item.source_extension in SUPPORTED_IMAGE_EXTENSIONS
+                                 else ".png")
+                    final_image_path = (
+                        candidates_dir / relative_parent /
+                        f"{file_stem}_RESTORED_v{variant_idx:02d}_try{attempt:02d}{extension}"
+                    )
+                    save_restored_image(image, final_image_path)
+                else:
+                    final_image_path = candidates_dir / f"{item.item_id}_{file_stem}_v{variant_idx:02d}_try{attempt:02d}.png"
+                    save_image(image, final_image_path)
 
                 if not job.qc_enabled:
                     # QC ausgeschaltet: Bild ist gespeichert, keine Bewertung.
@@ -1276,13 +1587,22 @@ def run_job(
                                  final_image_path.name)
                     break
 
-                qc_payload = gemini.qc_image(
-                    image_path=final_image_path,
-                    prompt=item_prompt,
-                    style=style,
-                    item=item,
-                    job=job,
-                )
+                if is_restoration:
+                    qc_payload = gemini.qc_restoration(
+                        source_path=Path(item.source_image_path),
+                        restored_path=final_image_path,
+                        prompt=item_prompt,
+                        style=style,
+                        job=job,
+                    )
+                else:
+                    qc_payload = gemini.qc_image(
+                        image_path=final_image_path,
+                        prompt=item_prompt,
+                        style=style,
+                        item=item,
+                        job=job,
+                    )
                 qc_score = float(qc_payload.get("score", 0) or 0)
                 qc_decision = clean_string(qc_payload.get("decision")).lower() or "reject"
                 qc_reason = clean_string(qc_payload.get("reason"))
@@ -1347,6 +1667,17 @@ def run_job(
             "prompt": candidate_results[0].prompt,
             "created_at": datetime.now().isoformat(timespec="seconds"),
         }
+        if is_restoration:
+            item_meta.update({
+                "source_image": item.source_image_path,
+                "source_relative_path": item.source_relative_path,
+                "source_dimensions": [item.source_width, item.source_height],
+                "final_dimensions": [item.source_width, item.source_height],
+                "model_aspect_ratio": generation_aspect_ratio,
+                "model_image_size": generation_image_size,
+                "style_mode": (style.style_preset_id
+                               if job.style_preset_id else "original_source_style"),
+            })
 
         if job.qc_enabled:
             # Bestes Bild wählen und nach selected/ kopieren.
@@ -1359,8 +1690,17 @@ def run_job(
                 reverse=True,
             )[0]
 
-            selected_name = f"{item.item_id}_{slugify(item.title or item.item_id)}_BEST.png"
-            selected_path = selected_dir / selected_name
+            if is_restoration:
+                relative = Path(item.source_relative_path)
+                extension = (item.source_extension
+                             if item.source_extension in SUPPORTED_IMAGE_EXTENSIONS
+                             else ".png")
+                selected_name = f"{relative.stem}_RESTORED{extension}"
+                selected_path = selected_dir / relative.parent / selected_name
+                ensure_dir(selected_path.parent)
+            else:
+                selected_name = f"{item.item_id}_{slugify(item.title or item.item_id)}_BEST.png"
+                selected_path = selected_dir / selected_name
             shutil.copy2(best.image_path, selected_path)
 
             item_meta.update({
@@ -1384,7 +1724,12 @@ def run_job(
         else:
             # QC aus: keine Auswahl — alle Bilder gleichwertig in images/.
             item_meta["images"] = [str(c.image_path) for c in candidate_results]
-        meta_path = metadata_dir / f"{item.item_id}.json"
+        if is_restoration:
+            relative = Path(item.source_relative_path)
+            meta_path = metadata_dir / relative.parent / f"{relative.stem}.json"
+            ensure_dir(meta_path.parent)
+        else:
+            meta_path = metadata_dir / f"{item.item_id}.json"
         meta_path.write_text(json.dumps(item_meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
         results_summary.append(item_meta)

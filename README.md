@@ -146,6 +146,20 @@ wenn ein Style/Template noch von Jobs verwendet wird.
   Items nötig). Zielanzahl über `target_count` steuern.
 - **`content_linked`** — genau ein Bild pro Content Item (z. B. ein Hintergrund
   pro Witz). Inhalte lassen sich beim Anlegen des Jobs direkt miterfassen.
+- **`image_restore`** — alle PNG-, JPG- und WebP-Bilder eines gewählten
+  Ordners originalgetreu neu erzeugen. Unterordner bleiben erhalten; jedes
+  Ergebnis wird auf exakt dieselben Pixelmaße wie sein Ausgangsbild gebracht.
+  Standardmäßig bleibt der individuelle Originalstil erhalten. Optional kann
+  ein Style Preset den Look des gesamten Jobs vereinheitlichen. Der
+  Restaurierungs-Standardprompt lässt sich pro Job vollständig anpassen, etwa
+  um gezielt Gegenstände zu entfernen oder andere Änderungen anzufordern.
+
+Bei `image_restore` vergleicht die optionale Qualitätskontrolle Original und
+Ergebnis gemeinsam. Sie bewertet insbesondere Bildaufbau, Geometrie,
+Detailqualität, Artefakte und ausdrücklich angeforderte Änderungen. Die App
+wählt Modellauflösung und das nächstpassende unterstützte Seitenverhältnis
+automatisch; der finale Export verwendet wieder die exakten Abmessungen und
+das Dateiformat des Ausgangsbildes.
 
 Pro Motiv erzeugt das Skript mehrere Varianten (`variants_per_item`), bewertet
 sie per QC und legt die beste in den Output-Ordner des Jobs.

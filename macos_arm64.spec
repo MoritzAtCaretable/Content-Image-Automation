@@ -124,7 +124,7 @@ app = BUNDLE(
     name="Content Image Automation.app",
     icon=str(ROOT / "scripts" / "AppIcon.icns"),
     bundle_identifier="de.caretable.content-image-automation",
-    version="0.1.0",
+    version="0.2.0",
     info_plist={
         "CFBundleDisplayName": "Content Image Automation",
         "CFBundleName": "Content Image Automation",

@@ -27,6 +27,11 @@ APP_SUPPORT = (
 )
 PROJECT_ROOT = APP_SUPPORT / "project"
 LOG_FILE = Path.home() / "Library" / "Logs" / "ContentImageAutomation.log"
+BUNDLED_PROJECT_VERSION = "0.2.0"
+VERSION_MARKER = ".caretable_bundle_version"
+PRESERVED_PROJECT_ENTRIES = {
+    ".env", ".git", "secrets", "outputs", "references",
+}
 
 
 def _bundle_root() -> Path:
@@ -35,12 +40,32 @@ def _bundle_root() -> Path:
 
 def _install_project_if_needed() -> None:
     seed = _bundle_root() / "project_seed"
-    if PROJECT_ROOT.exists():
-        return
     if not seed.is_dir():
         raise RuntimeError(f"Mitgeliefertes Projekt nicht gefunden: {seed}")
-    PROJECT_ROOT.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(seed, PROJECT_ROOT)
+    marker = PROJECT_ROOT / VERSION_MARKER
+    current_version = ""
+    try:
+        current_version = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+
+    if not PROJECT_ROOT.exists():
+        PROJECT_ROOT.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(seed, PROJECT_ROOT)
+    elif current_version != BUNDLED_PROJECT_VERSION:
+        # Eine neue DMG muss auch bestehende Installationen aktualisieren. Nur
+        # Programmdateien werden ueberlagert; lokale Konfiguration, Keys,
+        # Git-Metadaten, Referenzen und Ergebnisse bleiben erhalten.
+        for source in seed.iterdir():
+            if source.name in PRESERVED_PROJECT_ENTRIES:
+                continue
+            destination = PROJECT_ROOT / source.name
+            if source.is_dir():
+                shutil.copytree(source, destination, dirs_exist_ok=True)
+            else:
+                shutil.copy2(source, destination)
+
+    marker.write_text(BUNDLED_PROJECT_VERSION + "\n", encoding="utf-8")
 
 
 def _ensure_writable_directories() -> None:
@@ -61,6 +86,7 @@ def main() -> None:
             PROJECT_ROOT / ".env",
             PROJECT_ROOT / "scripts" / "image_generator_ui.py",
             PROJECT_ROOT / "scripts" / "generate_images.py",
+            PROJECT_ROOT / "scripts" / "restoration_defaults.py",
             PROJECT_ROOT / "secrets" / "service_account.json",
             PROJECT_ROOT / ".git",
             PROJECT_ROOT / "outputs",
@@ -78,6 +104,7 @@ def main() -> None:
             "image_generator_ui",
             "generate_images",
             "sheet_admin",
+            "restoration_defaults",
         ):
             try:
                 importlib.import_module(module_name)

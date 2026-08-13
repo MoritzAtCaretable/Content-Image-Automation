@@ -40,7 +40,8 @@ CANONICAL_COLUMNS: Dict[str, List[str]] = {
         "job_id", "status", "job_type", "job_name", "asset_goal",
         "source_collection", "style_preset_id", "prompt_template_id",
         "aspect_ratio", "image_size", "target_count", "variants_per_item",
-        "output_folder", "notes", "qc_enabled",
+        "output_folder", "notes", "qc_enabled", "restore_source_folder",
+        "restore_prompt",
     ],
     SHEET_ITEMS: [
         "item_id", "job_id", "content_type", "title",
@@ -228,6 +229,35 @@ class SheetAdmin:
 
     # -- Schreiben -----------------------------------------------------------
 
+    def ensure_columns(self, sheet_name: str, columns,
+                       table: Optional[SheetTable] = None) -> SheetTable:
+        """Ergaenzt neue kanonische Spalten, ohne bestehende Sheets umzubauen.
+
+        Alte Steuer-Sheets besitzen die Restaurierungsfelder noch nicht. Beim
+        ersten Speichern eines entsprechenden Jobs werden nur die benoetigten
+        Header rechts angehaengt; vorhandene Daten und Spalten bleiben an Ort
+        und Stelle.
+        """
+        if table is None:
+            table = self.load(sheet_name)
+        allowed = set(CANONICAL_COLUMNS.get(sheet_name, []))
+        missing = [clean_string(c) for c in columns
+                   if clean_string(c) in allowed
+                   and clean_string(c) not in table.col_index]
+        if not missing:
+            return table
+
+        ws = self._ws(sheet_name)
+        next_col = max(table.col_index.values(), default=0) + 1
+        payload = []
+        for offset, key in enumerate(missing):
+            payload.append({
+                "range": rowcol_to_a1(table.header_row, next_col + offset),
+                "values": [[key]],
+            })
+        ws.batch_update(payload, value_input_option="RAW")
+        return self.load(sheet_name)
+
     def append_record(self, sheet_name: str, record: Dict[str, str],
                       table: Optional[SheetTable] = None) -> None:
         """Hängt einen Datensatz als neue Zeile unter der Tabelle an.
@@ -236,6 +266,7 @@ class SheetAdmin:
         unmittelbar zuvor bereits frisch geladen wurde (spart einen Request)."""
         if table is None:
             table = self.load(sheet_name)   # frisch: Zeilennummern/IDs aktuell
+        table = self.ensure_columns(sheet_name, record.keys(), table=table)
         ws = self._ws(sheet_name)
         row_values = [clean_string(record.get(h, "")) for h in table.headers]
         last_row = (table.records[-1]["_row"] if table.records
@@ -248,6 +279,7 @@ class SheetAdmin:
         """Aktualisiert die Zeile mit der gegebenen ID (nur bekannte Spalten,
         eine Batch-Anfrage)."""
         table = self.load(sheet_name)
+        table = self.ensure_columns(sheet_name, record.keys(), table=table)
         existing = table.by_id(record_id)
         if existing is None:
             raise KeyError(f"{record_id} nicht in {sheet_name} gefunden")
