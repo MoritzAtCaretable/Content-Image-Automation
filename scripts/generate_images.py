@@ -46,10 +46,7 @@ SCOPES = [
 DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-lite-image"
 FULL_IMAGE_MODEL = "gemini-3.1-flash-image"     # Nano Banana 2
 LITE_ONLY_IMAGE_SIZE = "1K"
-RESTORATION_MODEL_MAX_SIZE = {
-    DEFAULT_IMAGE_MODEL: "1K",
-    FULL_IMAGE_MODEL: "4K",
-}
+FULL_MODEL_IMAGE_SIZES = {"1K", "2K", "4K"}
 DEFAULT_PLANNER_MODEL = "gemini-3.5-flash"
 DEFAULT_QC_MODEL = "gemini-3.1-flash-lite"
 ALLOWED_JOB_STATUSES = {"todo", "redo"}
@@ -143,6 +140,7 @@ class Job:
     restore_source_folder: str = ""
     restore_prompt: str = ""
     restore_model: str = DEFAULT_IMAGE_MODEL
+    restore_max_image_size: str = "1K"
     restore_transparency_background: str = "green"
 
 
@@ -424,10 +422,13 @@ def closest_supported_aspect_ratio(width: int, height: int) -> str:
     return min(SUPPORTED_ASPECT_RATIOS, key=distance)
 
 
-def restoration_model_size(model: str) -> str:
-    """Nutzt immer die groesste vom gewaehlten Modell unterstuetzte
-    Bildgroesse."""
-    return RESTORATION_MODEL_MAX_SIZE.get(clean_string(model), "1K")
+def restoration_model_size(model: str, requested_max_size: str = "1K") -> str:
+    """Lite ist technisch auf 1K begrenzt; beim grossen Flash-Modell gilt
+    die bewusst gewaehlte Kosten-/Qualitaetsobergrenze."""
+    if clean_string(model) != FULL_IMAGE_MODEL:
+        return "1K"
+    requested = clean_string(requested_max_size).upper()
+    return requested if requested in FULL_MODEL_IMAGE_SIZES else "1K"
 
 
 def crop_to_source_aspect_ratio(image: Image.Image, width: int,
@@ -773,6 +774,9 @@ def parse_jobs(df: pd.DataFrame, config: AppConfig) -> List[Job]:
             restore_prompt=clean_string(row.get("restore_prompt")),
             restore_model=(clean_string(row.get("restore_model"))
                            or DEFAULT_IMAGE_MODEL),
+            restore_max_image_size=(
+                clean_string(row.get("restore_max_image_size")).upper()
+                or "1K"),
             restore_transparency_background=restore_background,
         )
         jobs.append(job)
@@ -1542,7 +1546,8 @@ def run_job(
             generation_aspect_ratio = closest_supported_aspect_ratio(
                 item.source_width, item.source_height)
             generation_model = job.restore_model or DEFAULT_IMAGE_MODEL
-            generation_image_size = restoration_model_size(generation_model)
+            generation_image_size = restoration_model_size(
+                generation_model, job.restore_max_image_size)
             logging.info(
                 "[%s | %s] Restaurierung %sx%s -> %s, Format %s/%s; "
                 "Ausgabe behaelt das exakte Seitenverhaeltnis bei maximaler Aufloesung.",
@@ -1732,6 +1737,7 @@ def run_job(
                 "model_aspect_ratio": generation_aspect_ratio,
                 "model_image_size": generation_image_size,
                 "restoration_model": generation_model,
+                "requested_max_image_size": job.restore_max_image_size,
                 "transparency_background": job.restore_transparency_background,
                 "style_mode": (style.style_preset_id
                                if job.style_preset_id else "original_source_style"),

@@ -1088,6 +1088,11 @@ class ImageGeneratorApp(ctk.CTk):
                     or _clean(dlg.initial.get("job_type"))
                     or "batch_theme")
 
+        def selected_restore_model(dlg):
+            return (_clean(dlg.values.get("restore_model"))
+                    or _clean(dlg.initial.get("restore_model"))
+                    or RESTORATION_MODELS[0])
+
         def tpl_opts(dlg):
             jt = _clean(dlg.values.get("job_type"))
             rows = [r for r in tpl_tbl.records if _clean(r.get("prompt_template_id"))]
@@ -1222,15 +1227,28 @@ class ImageGeneratorApp(ctk.CTk):
                  "help": "Wie viele Kandidaten pro Motiv erzeugt werden. Ohne "
                          "Qualitätskontrolle reicht meist 1 (keine Auswahl nötig)."},
             ]},
-            {"title": "Restaurierungsqualität",
+            {"title": "Restaurierungsmodell",
              "skip": lambda dlg: selected_job_type(dlg) != "image_restore",
              "fields": [
                 {"key": "restore_model", "label": "Restaurierungsmodell",
                  "type": "option", "values": RESTORATION_MODELS,
                  "default": RESTORATION_MODELS[0],
-                 "help": "Die App nutzt automatisch die größte unterstützte "
-                         "Auflösung: gemini-3.1-flash-lite-image bis 1K, "
-                         "gemini-3.1-flash-image bis 4K."},
+                 "help": "Lite erzeugt immer maximal 1K. Beim großen Flash-Modell "
+                         "wird im nächsten Schritt eine Obergrenze gewählt."},
+            ]},
+            {"title": "Maximale Flash-Auflösung",
+             "skip": lambda dlg: (selected_job_type(dlg) != "image_restore"
+                                  or selected_restore_model(dlg)
+                                  != "gemini-3.1-flash-image"),
+             "fields": [
+                {"key": "restore_max_image_size", "label": "Maximale Bildgröße",
+                 "type": "option", "values": IMAGE_SIZES, "default": "1K",
+                 "help": "1K ist am schnellsten und günstigsten. 2K oder 4K nur "
+                         "wählen, wenn die zusätzliche Auflösung wirklich benötigt wird."},
+            ]},
+            {"title": "Restaurierungsqualität",
+             "skip": lambda dlg: selected_job_type(dlg) != "image_restore",
+             "fields": [
                 {"key": "restore_transparency_background",
                  "label": "Hintergrund für transparente PNGs", "type": "option",
                  "values": ["green", "white"], "default": "green",
@@ -1355,6 +1373,9 @@ class ImageGeneratorApp(ctk.CTk):
                 "Ausgangsbilder originalgetreu rekonstruieren und Details, "
                 "Linien sowie Schaerfe verbessern"
             )
+        if (values.get("job_type") == "image_restore"
+                and values.get("restore_model") != "gemini-3.1-flash-image"):
+            values["restore_max_image_size"] = "1K"
         items = list(dlg.extra.get("items", []))
 
         def work():

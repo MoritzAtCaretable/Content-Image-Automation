@@ -106,8 +106,16 @@ class ImageRestoreTests(unittest.TestCase):
         self.assertEqual(closest_supported_aspect_ratio(1080, 1920), "9:16")
         self.assertEqual(restoration_model_size("gemini-3.1-flash-lite-image"),
                          "1K")
-        self.assertEqual(restoration_model_size("gemini-3.1-flash-image"),
-                         "4K")
+        self.assertEqual(restoration_model_size(
+            "gemini-3.1-flash-lite-image", "4K"), "1K")
+        self.assertEqual(restoration_model_size(
+            "gemini-3.1-flash-image", "1K"), "1K")
+        self.assertEqual(restoration_model_size(
+            "gemini-3.1-flash-image", "2K"), "2K")
+        self.assertEqual(restoration_model_size(
+            "gemini-3.1-flash-image", "4K"), "4K")
+        self.assertEqual(restoration_model_size(
+            "gemini-3.1-flash-image", "invalid"), "1K")
 
     def test_output_uses_largest_exact_source_ratio_without_stretching(self):
         restored = crop_to_source_aspect_ratio(
@@ -206,6 +214,31 @@ class ImageRestoreTests(unittest.TestCase):
             self.assertEqual(payload["final_dimensions"], [963, 591])
             self.assertEqual(payload["restoration_model"],
                              "gemini-3.1-flash-lite-image")
+            self.assertEqual(payload["requested_max_image_size"], "1K")
+
+    def test_pipeline_passes_selected_flash_resolution_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "input"
+            source.mkdir()
+            Image.new("RGB", (400, 300)).save(source / "bild.png")
+            gemini = FakeGemini()
+
+            run_job(
+                workbook=FakeWorkbook(),
+                config=make_config(root),
+                gemini=gemini,
+                job=make_job(
+                    "input", "output",
+                    restore_model="gemini-3.1-flash-image",
+                    restore_max_image_size="2K",
+                    qc_enabled=False,
+                ),
+                styles={}, templates={}, content_items=[],
+            )
+
+            self.assertEqual(gemini.calls[0][4], "gemini-3.1-flash-image")
+            self.assertEqual(gemini.calls[0][2], "2K")
 
 
 if __name__ == "__main__":

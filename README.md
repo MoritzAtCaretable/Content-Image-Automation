@@ -149,8 +149,10 @@ wenn ein Style/Template noch von Jobs verwendet wird.
 - **`image_restore`** — alle PNG-, JPG- und WebP-Bilder eines gewählten
   Ordners originalgetreu neu erzeugen. Unterordner bleiben erhalten; jedes
   Ergebnis behält das exakte Seitenverhältnis seines Ausgangsbildes, wird aber
-  in der größtmöglichen Auflösung des gewählten Modells erzeugt. Das Lite-Modell
-  liefert maximal 1K, das große Flash-Modell maximal 4K. Standardmäßig bleibt
+  in der festgelegten Maximalauflösung des gewählten Modells erzeugt. Das
+  Lite-Modell liefert technisch bedingt maximal 1K. Beim großen Flash-Modell
+  lässt sich die Obergrenze pro Job auf 1K, 2K oder 4K setzen; Standard ist
+  kostenbewusst 1K. Standardmäßig bleibt
   der individuelle Originalstil erhalten. Optional kann ein Style Preset den
   Look des gesamten Jobs vereinheitlichen. Transparente PNG-Bereiche werden
   wahlweise auf Chroma-Grün oder Weiß statt auf Schwarz gelegt. Der
