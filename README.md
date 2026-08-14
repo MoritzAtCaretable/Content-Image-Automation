@@ -163,8 +163,11 @@ Bei `image_restore` vergleicht die optionale Qualitätskontrolle Original und
 Ergebnis gemeinsam. Sie bewertet insbesondere Bildaufbau, Geometrie,
 Detailqualität, Artefakte und ausdrücklich angeforderte Änderungen. Die App
 wählt Modellauflösung und das nächstpassende unterstützte Seitenverhältnis
-automatisch; der finale Export schneidet ohne Verzerrung auf das exakte
-Original-Seitenverhältnis zu und verwendet das Dateiformat des Ausgangsbildes.
+automatisch. Referenz und Ergebnis werden mit Schutzrändern eingepasst, statt
+das Motiv zuzuschneiden: Gegenstände bleiben vollständig sichtbar und werden
+nicht verzerrt. Bei normalen Bildern werden zusätzliche Randpixel aus den
+Bildkanten fortgeführt; bei transparenten PNGs wird die gewählte Grün-/Weiß-
+Fläche verwendet. Der Export verwendet das Dateiformat des Ausgangsbildes.
 
 Pro Motiv erzeugt das Skript mehrere Varianten (`variants_per_item`), bewertet
 sie per QC und legt die beste in den Output-Ordner des Jobs.

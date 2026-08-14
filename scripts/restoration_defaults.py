@@ -24,6 +24,8 @@ Improve only:
 
 Do not add, remove, move, replace, redesign or reinterpret anything.
 Do not crop, extend, rotate or mirror the image.
+Do not zoom into the subject. Keep every object fully visible with at least
+the same breathing room to all image edges as in the source.
 Do not invent text, logos, faces, objects or background details.
 The result must look like a higher-quality reconstruction of the same image,
 not like a new composition or a stylistic reinterpretation."""

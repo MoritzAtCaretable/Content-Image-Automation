@@ -16,9 +16,9 @@ from generate_images import (  # noqa: E402
     AppConfig,
     Job,
     closest_supported_aspect_ratio,
-    crop_to_source_aspect_ratio,
     flatten_transparency,
     original_image_style,
+    pad_to_source_aspect_ratio,
     prepare_restoration_items,
     render_restoration_prompt,
     restoration_model_size,
@@ -89,9 +89,11 @@ class FakeGemini:
 
     def generate_image(self, prompt, aspect_ratio, image_size,
                        reference_images, model_override="",
-                       transparency_background="green"):
+                       transparency_background="green",
+                       pad_first_reference_to_aspect=""):
         self.calls.append((prompt, aspect_ratio, image_size, reference_images,
-                           model_override, transparency_background))
+                           model_override, transparency_background,
+                           pad_first_reference_to_aspect))
         return Image.new("RGB", (1024, 1024), (90, 120, 150))
 
     def qc_restoration(self, source_path, restored_path, prompt, style, job):
@@ -117,11 +119,18 @@ class ImageRestoreTests(unittest.TestCase):
         self.assertEqual(restoration_model_size(
             "gemini-3.1-flash-image", "invalid"), "1K")
 
-    def test_output_uses_largest_exact_source_ratio_without_stretching(self):
-        restored = crop_to_source_aspect_ratio(
-            Image.new("RGB", (1024, 1536)), 277, 429)
-        self.assertEqual(restored.size, (831, 1287))
-        self.assertEqual(restored.width * 429, restored.height * 277)
+    def test_output_keeps_complete_image_and_adds_padding_instead_of_cropping(self):
+        source = Image.new("RGB", (1024, 1536), (20, 30, 40))
+        source.putpixel((0, 0), (255, 0, 0))
+        source.putpixel((1023, 1535), (0, 0, 255))
+        restored = pad_to_source_aspect_ratio(
+            source, 277, 429, background="white",
+            source_has_transparency=True)
+        self.assertEqual(restored.size, (1024, 1586))
+        top = (restored.height - source.height) // 2
+        self.assertEqual(restored.getpixel((0, top)), (255, 0, 0))
+        self.assertEqual(restored.getpixel((1023, top + 1535)), (0, 0, 255))
+        self.assertEqual(restored.getpixel((0, 0)), (255, 255, 255))
 
     def test_transparency_uses_green_or_white_instead_of_black(self):
         transparent = Image.new("RGBA", (2, 2), (0, 0, 0, 0))
@@ -138,7 +147,8 @@ class ImageRestoreTests(unittest.TestCase):
             source = root / "input"
             (source / "unterordner").mkdir(parents=True)
             Image.new("RGB", (640, 360)).save(source / "a.jpg")
-            Image.new("RGB", (333, 500)).save(source / "unterordner" / "b.png")
+            Image.new("RGBA", (333, 500), (0, 0, 0, 0)).save(
+                source / "unterordner" / "b.png")
             output = source / "results"
             output.mkdir()
             Image.new("RGB", (10, 10)).save(output / "ignore.png")
@@ -152,6 +162,7 @@ class ImageRestoreTests(unittest.TestCase):
                              (640, 360))
             self.assertEqual(items[1].source_relative_path,
                              "unterordner/b.png")
+            self.assertTrue(items[1].source_has_transparency)
 
     def test_prompt_uses_default_or_custom_instruction(self):
         from generate_images import ContentItem
@@ -197,24 +208,27 @@ class ImageRestoreTests(unittest.TestCase):
             selected = root / "output" / "selected" / "set_a" / "foto_RESTORED.jpg"
             self.assertTrue(selected.exists())
             with Image.open(selected) as image:
-                self.assertEqual(image.size, (963, 591))
-                self.assertEqual(image.width * 197, image.height * 321)
+                self.assertEqual(image.size, (1669, 1024))
+                self.assertAlmostEqual(image.width / image.height,
+                                       321 / 197, places=3)
             self.assertEqual(gemini.calls[0][1], "3:2")
             self.assertEqual(gemini.calls[0][2], "1K")
             self.assertEqual(gemini.calls[0][4],
                              "gemini-3.1-flash-lite-image")
             self.assertEqual(gemini.calls[0][5], "green")
-            self.assertEqual(gemini.qc_calls[0][2], (963, 591))
+            self.assertEqual(gemini.calls[0][6], "3:2")
+            self.assertEqual(gemini.qc_calls[0][2], (1669, 1024))
             self.assertEqual(workbook.jobs.status, "done")
             self.assertEqual(result["items_processed"], 1)
 
             metadata = root / "output" / "metadata" / "set_a" / "foto.json"
             payload = json.loads(metadata.read_text(encoding="utf-8"))
             self.assertEqual(payload["source_dimensions"], [321, 197])
-            self.assertEqual(payload["final_dimensions"], [963, 591])
+            self.assertEqual(payload["final_dimensions"], [1669, 1024])
             self.assertEqual(payload["restoration_model"],
                              "gemini-3.1-flash-lite-image")
             self.assertEqual(payload["requested_max_image_size"], "1K")
+            self.assertEqual(payload["aspect_fit_mode"], "contain_with_padding")
 
     def test_pipeline_passes_selected_flash_resolution_limit(self):
         with tempfile.TemporaryDirectory() as tmp:

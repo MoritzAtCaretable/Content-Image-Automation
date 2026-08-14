@@ -117,6 +117,7 @@ class ContentItem:
     source_width: int = 0
     source_height: int = 0
     source_extension: str = ".png"
+    source_has_transparency: bool = False
 
 
 @dataclass
@@ -431,32 +432,90 @@ def restoration_model_size(model: str, requested_max_size: str = "1K") -> str:
     return requested if requested in FULL_MODEL_IMAGE_SIZES else "1K"
 
 
-def crop_to_source_aspect_ratio(image: Image.Image, width: int,
-                                height: int) -> Image.Image:
-    """Schneidet mittig und ohne Verzerrung auf das exakte Quellverhaeltnis.
+def image_has_transparency(image: Image.Image) -> bool:
+    if image.mode in {"RGBA", "LA"}:
+        return image.getchannel("A").getextrema()[0] < 255
+    return image.mode == "P" and "transparency" in image.info
 
-    Gemini akzeptiert nur eine begrenzte Menge von Seitenverhaeltnissen. Nach
-    der Generierung wird daher lediglich der kleine Ueberstand des
-    naechstpassenden Modellformats entfernt. Die maximal erzeugte Aufloesung
-    bleibt erhalten; es wird nicht auf die alten Pixelmasse verkleinert.
+
+def _background_rgb(background: str) -> Tuple[int, int, int]:
+    return ((255, 255, 255) if background == "white"
+            else (0, 255, 0))
+
+
+def pad_to_aspect_ratio(
+    image: Image.Image,
+    ratio_width: int,
+    ratio_height: int,
+    background: str = "green",
+    solid_background: bool = False,
+) -> Image.Image:
+    """Ergaenzt Rand statt Motivteile abzuschneiden oder zu verzerren.
+
+    Transparente Quellen erhalten einen sauberen Chroma-/Weiss-Hintergrund.
+    Bei normalen Bildern werden die aeussersten Pixel weich als Rand
+    fortgesetzt, damit keine auffaelligen Farbbalken entstehen.
     """
-    if width <= 0 or height <= 0:
+    if ratio_width <= 0 or ratio_height <= 0:
         raise ValueError("Ungueltiges Seitenverhaeltnis fuer Restaurierung")
-    restored = image.convert("RGB")
-    divisor = math.gcd(width, height)
-    ratio_width = width // divisor
-    ratio_height = height // divisor
-    multiplier = min(restored.width // ratio_width,
-                     restored.height // ratio_height)
-    if multiplier <= 0:
-        raise ValueError(
-            "Das generierte Bild ist zu klein fuer das Quell-Seitenverhaeltnis")
-    crop_width = ratio_width * multiplier
-    crop_height = ratio_height * multiplier
-    left = (restored.width - crop_width) // 2
-    top = (restored.height - crop_height) // 2
-    box = (left, top, left + crop_width, top + crop_height)
-    return restored.crop(box)
+    source = image.convert("RGB")
+    target_ratio = ratio_width / ratio_height
+    current_ratio = source.width / source.height
+    if abs(current_ratio - target_ratio) < 1e-7:
+        return source
+
+    if current_ratio > target_ratio:
+        target_width = source.width
+        target_height = math.ceil(source.width / target_ratio)
+    else:
+        target_width = math.ceil(source.height * target_ratio)
+        target_height = source.height
+
+    left = (target_width - source.width) // 2
+    top = (target_height - source.height) // 2
+    right = target_width - source.width - left
+    bottom = target_height - source.height - top
+    canvas = Image.new("RGB", (target_width, target_height),
+                       _background_rgb(background))
+
+    if not solid_background:
+        # Nur die fehlende Achse wird aus dem jeweiligen aeussersten Pixelrand
+        # verlaengert. Das Motiv selbst wird weder skaliert noch dupliziert.
+        if left:
+            edge = source.crop((0, 0, 1, source.height)).resize(
+                (left, source.height), Image.Resampling.BILINEAR)
+            canvas.paste(edge, (0, top))
+        if right:
+            edge = source.crop((source.width - 1, 0, source.width,
+                                source.height)).resize(
+                (right, source.height), Image.Resampling.BILINEAR)
+            canvas.paste(edge, (left + source.width, top))
+        if top:
+            edge = source.crop((0, 0, source.width, 1)).resize(
+                (source.width, top), Image.Resampling.BILINEAR)
+            canvas.paste(edge, (left, 0))
+        if bottom:
+            edge = source.crop((0, source.height - 1, source.width,
+                                source.height)).resize(
+                (source.width, bottom), Image.Resampling.BILINEAR)
+            canvas.paste(edge, (left, top + source.height))
+
+    canvas.paste(source, (left, top))
+    return canvas
+
+
+def pad_to_source_aspect_ratio(
+    image: Image.Image,
+    width: int,
+    height: int,
+    background: str,
+    source_has_transparency: bool,
+) -> Image.Image:
+    """Behält das komplette generierte Bild und ergaenzt nur den Rand, der
+    fuer das Quell-Seitenverhaeltnis fehlt."""
+    return pad_to_aspect_ratio(
+        image, width, height, background=background,
+        solid_background=source_has_transparency)
 
 
 def flatten_transparency(image: Image.Image, background: str) -> Image.Image:
@@ -528,6 +587,7 @@ def prepare_restoration_items(job: Job, config: AppConfig) -> List[ContentItem]:
             with Image.open(source_path) as raw:
                 oriented = ImageOps.exif_transpose(raw)
                 width, height = oriented.size
+                has_transparency = image_has_transparency(oriented)
         except Exception as exc:
             logging.warning("Ungueltiges Quellbild wird uebersprungen: %s (%s)",
                             source_path, exc)
@@ -545,6 +605,7 @@ def prepare_restoration_items(job: Job, config: AppConfig) -> List[ContentItem]:
             source_width=width,
             source_height=height,
             source_extension=source_path.suffix.lower(),
+            source_has_transparency=has_transparency,
         ))
 
     if not items:
@@ -1118,13 +1179,24 @@ extra_notes: {style.extra_notes}
         reference_images: Optional[List[Path]] = None,
         model_override: str = "",
         transparency_background: str = "green",
+        pad_first_reference_to_aspect: str = "",
     ) -> Image.Image:
         parts: List[Any] = [prompt]
-        for ref_path in reference_images or []:
+        for index, ref_path in enumerate(reference_images or []):
             with Image.open(ref_path) as ref:
                 oriented = ImageOps.exif_transpose(ref)
-                parts.append(flatten_transparency(
-                    oriented, transparency_background).copy())
+                was_transparent = image_has_transparency(oriented)
+                prepared = flatten_transparency(
+                    oriented, transparency_background)
+                if index == 0 and pad_first_reference_to_aspect:
+                    ratio_w, ratio_h = (
+                        int(value) for value
+                        in pad_first_reference_to_aspect.split(":", 1))
+                    prepared = pad_to_aspect_ratio(
+                        prepared, ratio_w, ratio_h,
+                        background=transparency_background,
+                        solid_background=was_transparent)
+                parts.append(prepared.copy())
 
         size = clean_string(image_size).upper() or self.config.image_size_default
         model = clean_string(model_override) or self._resolve_image_model(size)
@@ -1250,6 +1322,11 @@ identity, colors and style while improving clarity and fine detail. If the
 instruction explicitly requests a removal or alteration, judge that requested
 change as correct rather than penalizing it.
 
+Highest priority: every source object and all original edge clearance must be
+fully visible. Set decision to "retry" for any candidate that zooms in, clips
+a subject, cuts off an object at an edge, or enlarges the subject relative to
+the canvas. Protective padding used to retain the complete frame is acceptable.
+
 Use a strict score. Choose retry when another generation attempt could likely
 fix visible drift or artifacts. Reject severe structural changes.
 
@@ -1345,7 +1422,11 @@ Preserve the exact source aspect ratio {item.source_width}:{item.source_height}.
 Generate at the highest resolution supported by the selected model.
 The original pixel dimensions {item.source_width} x {item.source_height} are
 reference dimensions only and must not limit the output resolution.
-Preserve the full frame and do not change the orientation.
+The source may be centered inside a slightly padded model canvas. Treat that
+padding only as a protective margin. Reconstruct the COMPLETE inner source
+frame. Never zoom in, crop an object, move an object beyond an edge, or make
+the main subject larger relative to the canvas. Preserve all original edge
+clearance and do not change the orientation.
 {style_instruction}
 """.strip()
     return f"{prompt.strip()}\n\nTechnical restoration constraints:\n{technical}"
@@ -1600,6 +1681,8 @@ def run_job(
                         transparency_background=(
                             job.restore_transparency_background
                             if is_restoration else "green"),
+                        pad_first_reference_to_aspect=(
+                            generation_aspect_ratio if is_restoration else ""),
                     )
                 except Exception as e:
                     consecutive_failures += 1
@@ -1619,8 +1702,10 @@ def run_job(
 
                 file_stem = item.output_name_hint or slugify(item.title or item.item_id)
                 if is_restoration:
-                    image = crop_to_source_aspect_ratio(
-                        image, item.source_width, item.source_height)
+                    image = pad_to_source_aspect_ratio(
+                        image, item.source_width, item.source_height,
+                        background=job.restore_transparency_background,
+                        source_has_transparency=item.source_has_transparency)
                     relative_parent = Path(item.source_relative_path).parent
                     extension = (item.source_extension
                                  if item.source_extension in SUPPORTED_IMAGE_EXTENSIONS
@@ -1733,12 +1818,14 @@ def run_job(
                 "source_relative_path": item.source_relative_path,
                 "source_dimensions": [item.source_width, item.source_height],
                 "source_aspect_ratio": f"{item.source_width}:{item.source_height}",
+                "source_has_transparency": item.source_has_transparency,
                 "final_dimensions": restored_dimensions,
                 "model_aspect_ratio": generation_aspect_ratio,
                 "model_image_size": generation_image_size,
                 "restoration_model": generation_model,
                 "requested_max_image_size": job.restore_max_image_size,
                 "transparency_background": job.restore_transparency_background,
+                "aspect_fit_mode": "contain_with_padding",
                 "style_mode": (style.style_preset_id
                                if job.style_preset_id else "original_source_style"),
             })
